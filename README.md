@@ -1,12 +1,12 @@
 # SlopRadar
-
-🥋                   💥
-_O/  👟               O
-  \                  /▌\
- _/ \                / \
-
+```text
+     🥋                      💥
+   _O/  ~ ~ ~ 👟            O
+     \                     /▌\
+    _/ \                   / \
+ [Radical]               [Slop]
  ## Anti Slop Protocol
-
+```
 SlopRadar actively purges low value engagement bait from your social timeline. The extension utilizes local on device browser intelligence to instantly analyze text nodes and block posts containing corporate platitudes, fake narrative arcs, and robotic self promotion. 
 
 When a post triggers the filter, the extension applies a heavy blur to the offending content and overlays a definitive warning stamp. Authentic technical insights and genuine thoughts pass through untouched.
