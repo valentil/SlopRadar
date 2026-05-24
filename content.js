@@ -47,7 +47,7 @@ slopStyle.textContent = `
   }
   .not_slop_ribbon_container {
     position: absolute !important;
-    top: 0 !important;
+    top: -100px !important;
     right: 0 !important;
     width: 260px !important;
     height: 260px !important;

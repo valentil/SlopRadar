@@ -27,7 +27,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
-    const structuredPrompt = `Classify this post text. If it contains generic marketing, tech hype, engagement bait, corporate templates, space-maximizing short line breaks, narrative arcs like "the hard part", or robotic self promotion, classify as slop (1). If it is a raw technical insight, actual code, or genuine personal thought, classify as authentic (0). Be highly cynical and hyper-sensitive.
+    const structuredPrompt = `Classify this post text. If it contains generic marketing, tech hype, engagement bait, corporate templates, hooks like "What surprised me most:", phrases like "these aren't just", "this isn't this it's that", "is not .... it is", "quietly", "implying a hidden agenda", or "The hardest part wasn't", grand philosophical parallel tracking like "The constraint did not weaken. The systems being asked to violate it got larger", full article links, long narrative stories, space maximizing short line breaks, narrative arcs like "the hard part", or robotic self promotion, classify as slop (1). If it is a raw technical insight, actual code, or genuine personal thought, classify as authentic (0). Be highly cynical and hyper sensitive.
 
 Input Text:
 """
