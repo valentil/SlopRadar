@@ -127,118 +127,169 @@ slopStyle.textContent = `
   /* ── Card base ── */
   .slop_radar_card { position: relative !important; }
 
-  /* ── Dog-ear (shared: slop=red, notslop=green) ── */
-  .slop_dog_ear, .not_slop_dog_ear {
+  /* ══════════════════════════════════════════════════
+     SLOP: horizontal banner across card top + blur
+  ══════════════════════════════════════════════════ */
+  .slop_dog_ear {
     position: absolute !important;
-    top: -100px !important; right: 0 !important;
-    width: 260px !important; height: 260px !important;
-    overflow: hidden !important;
-    pointer-events: none !important;
+    top: 0 !important; left: 0 !important; right: 0 !important;
+    height: auto !important;
+    background: var(--sr-red) !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    padding: 8px 14px !important;
     z-index: 99999 !important;
-  }
-  .slop_dog_ear_ribbon, .not_slop_ribbon {
-    position: absolute !important;
-    top: 50px !important; right: -65px !important; width: 360px !important;
-    padding: 11px 0 !important; text-align: center !important;
-    font-size: 1rem !important; font-weight: 900 !important;
-    transform: rotate(45deg) !important;
-    letter-spacing: 0.14rem !important; white-space: nowrap !important;
-    display: flex !important; flex-direction: column !important;
-    align-items: center !important; gap: 2px !important;
-    user-select: none !important; pointer-events: none !important;
-    color: #fff !important;
+    pointer-events: none !important;
+    box-shadow: 0 2px 12px rgba(224,36,36,0.35) !important;
+    box-sizing: border-box !important;
   }
   .slop_dog_ear_ribbon {
-    background: var(--sr-red) !important;
-    box-shadow: 0 4px 18px rgba(224,36,36,0.45) !important;
-  }
-  .not_slop_ribbon {
-    background: var(--sr-green) !important;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.28) !important;
-  }
-  .slop_dog_ear_ribbon .sr-sub, .not_slop_ribbon .sr-sub {
-    font-size: 0.68rem !important; opacity: 0.88 !important;
-    font-weight: 700 !important; letter-spacing: 0.05rem !important;
-  }
-
-  /* ── TWITTER: blur via data-sr-revealed attribute ── */
-  .slop_radar_twitter[data-slop-detected="true"]:not([data-sr-revealed]) .sr_blurable {
-    filter: blur(7px) !important;
-    opacity: 0.22 !important;
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    gap: 8px !important;
     pointer-events: none !important;
     user-select: none !important;
-    transition: filter 0.2s, opacity 0.2s !important;
+    flex: 1 !important;
   }
-  .slop_radar_twitter[data-slop-detected="true"][data-sr-revealed] .sr_blurable {
-    filter: none !important;
-    opacity: 1 !important;
-    pointer-events: auto !important;
+  .slop_dog_ear_ribbon .sr-main {
+    color: #fff !important;
+    font-size: 0.85rem !important;
+    font-weight: 900 !important;
+    letter-spacing: 0.12rem !important;
+    text-transform: uppercase !important;
+    white-space: nowrap !important;
   }
-
-  /* ── LINKEDIN: collapse ── */
-  .slop_radar_linkedin[data-slop-detected="true"]:not([data-sr-revealed]) {
-    max-height: 180px !important;
-    overflow: hidden !important;
-  }
-  .slop_radar_linkedin[data-slop-detected="true"][data-sr-revealed] {
-    max-height: 3000px !important; overflow: visible !important;
-  }
-  .slop_radar_linkedin[data-slop-detected="true"]:not([data-sr-revealed]) .sr_blurable {
-    opacity: 0.05 !important; filter: blur(6px) !important;
-    pointer-events: none !important;
-  }
-  .slop_radar_linkedin[data-slop-detected="true"][data-sr-revealed] .sr_blurable {
-    filter: none !important; opacity: 1 !important; pointer-events: auto !important;
+  .slop_dog_ear_ribbon .sr-sub {
+    color: rgba(255,255,255,0.75) !important;
+    font-size: 0.7rem !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
   }
 
-  /* ── UNIVERSAL: same as linkedin ── */
-  .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]) {
-    max-height: 160px !important; overflow: hidden !important;
-  }
-  .slop_radar_universal[data-slop-detected="true"][data-sr-revealed] {
-    max-height: 3000px !important; overflow: visible !important;
-  }
-  .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]) .sr_blurable {
-    opacity: 0.05 !important; filter: blur(6px) !important;
-    pointer-events: none !important;
-  }
-
-  /* ── Controls bar ── */
-  .slop_radar_controls {
+  /* blur: covers everything below the banner */
+  .sr_blur_cover {
     position: absolute !important;
-    left: 12px !important; right: 12px !important; bottom: 8px !important;
-    display: flex !important; align-items: center !important; gap: 8px !important;
-    z-index: 100001 !important; pointer-events: auto !important;
+    /* top set by JS to banner height */
+    left: 0 !important; right: 0 !important; bottom: 0 !important;
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
+    background: rgba(0,0,0,0.08) !important;
+    z-index: 99998 !important;
+    pointer-events: none !important;
+    transition: opacity 0.2s !important;
   }
-  /* Twitter controls: below the ribbon, right-aligned */
-  .slop_radar_twitter .slop_radar_controls {
-    top: 148px !important; bottom: auto !important;
-    left: auto !important; right: 12px !important;
-    flex-direction: column !important; align-items: flex-end !important;
+  [data-sr-revealed] .sr_blur_cover { display: none !important; }
+
+  /* Controls: sit inside the banner on the right */
+  .slop_radar_controls {
+    display: flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    margin-left: auto !important;
+    pointer-events: auto !important;
+    z-index: 100001 !important;
+    flex-shrink: 0 !important;
   }
   .slop_radar_btn {
     font-size: 0.72rem !important; font-weight: 800 !important;
-    color: #fff !important; cursor: pointer !important;
-    border: none !important; border-radius: 6px !important;
-    padding: 5px 12px !important;
-    background: var(--sr-red) !important;
+    cursor: pointer !important;
+    border-radius: 5px !important;
+    padding: 4px 11px !important;
     pointer-events: auto !important; z-index: 100002 !important;
-    white-space: nowrap !important; transition: opacity 0.12s !important;
-    line-height: 1.5 !important; letter-spacing: 0.04rem !important;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+    white-space: nowrap !important;
+    line-height: 1.5 !important; letter-spacing: 0.03rem !important;
+    transition: opacity 0.12s !important;
+    background: rgba(255,255,255,0.18) !important;
+    color: #fff !important;
+    border: 1px solid rgba(255,255,255,0.35) !important;
+    box-shadow: none !important;
   }
-  .slop_radar_btn:hover { opacity: 0.85 !important; }
+  .slop_radar_btn:hover { background: rgba(255,255,255,0.28) !important; }
   .slop_radar_btn.sr-secondary {
     background: var(--sr-btn-bg) !important;
     color: var(--sr-text2) !important;
     border: 1px solid var(--sr-border) !important;
-    box-shadow: none !important;
   }
   .slop_radar_btn.sr-secondary:hover { background: var(--sr-btn-hover) !important; }
 
-  /* Twitter bigger buttons */
-  .slop_radar_twitter .slop_radar_btn {
-    font-size: 0.8rem !important; padding: 6px 14px !important;
+  /* LinkedIn/universal: content collapses below banner */
+  .slop_radar_linkedin[data-slop-detected="true"]:not([data-sr-revealed]),
+  .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]) {
+    max-height: 80px !important;
+    overflow: hidden !important;
+  }
+  .slop_radar_linkedin[data-slop-detected="true"][data-sr-revealed],
+  .slop_radar_universal[data-slop-detected="true"][data-sr-revealed] {
+    max-height: 3000px !important;
+    overflow: visible !important;
+  }
+
+  /* Twitter: full height, blur cover visible */
+  .slop_radar_twitter[data-slop-detected="true"] {
+    /* no height collapse — tweet stays full size, blur cover handles it */
+  }
+
+  /* sr_blurable: needed for non-backdrop-filter fallback only */
+  [data-slop-detected="true"]:not([data-sr-revealed]) .sr_blurable {
+    pointer-events: none !important;
+    user-select: none !important;
+  }
+
+  /* ══════════════════════════════════════════════════
+     NOT SLOP: bottom-right corner tag, no emoji
+  ══════════════════════════════════════════════════ */
+  .not_slop_dog_ear {
+    position: absolute !important;
+    bottom: 8px !important;
+    right: 8px !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    pointer-events: none !important;
+    z-index: 99999 !important;
+  }
+  .not_slop_ribbon {
+    display: inline-flex !important;
+    align-items: center !important;
+    padding: 4px 10px !important;
+    background: var(--sr-green-bg) !important;
+    border: 1px solid var(--sr-green-border) !important;
+    border-radius: 6px !important;
+    font-size: 0.68rem !important;
+    font-weight: 800 !important;
+    color: var(--sr-green) !important;
+    letter-spacing: 0.08rem !important;
+    white-space: nowrap !important;
+    pointer-events: none !important;
+    user-select: none !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.1) !important;
+  }
+  .not_slop_ribbon .sr-sub {
+    font-weight: 600 !important;
+    opacity: 0.75 !important;
+    margin-left: 4px !important;
+    font-size: 0.63rem !important;
+  }
+  /* Trash can sits right next to the tag */
+  .not_slop_trash_btn {
+    pointer-events: auto !important;
+    background: var(--sr-btn-bg) !important;
+    border: 1px solid var(--sr-border) !important;
+    border-radius: 5px !important;
+    width: 26px !important; height: 26px !important;
+    display: flex !important; align-items: center !important;
+    justify-content: center !important;
+    font-size: 0.8rem !important; cursor: pointer !important;
+    box-shadow: var(--sr-shadow) !important;
+    z-index: 100000 !important;
+    flex-shrink: 0 !important;
+    transition: background 0.12s !important;
+  }
+  .not_slop_trash_btn:hover {
+    background: var(--sr-red-dim) !important;
+    border-color: var(--sr-red-border) !important;
   }
 
   /* ── NOT SLOP badge (Twitter) ── */
@@ -256,18 +307,6 @@ slopStyle.textContent = `
     font-size: 0.7rem !important; cursor: pointer !important; pointer-events: auto !important;
   }
   .not_slop_tw_trash_btn:hover { background: var(--sr-red-dim) !important; border-color: var(--sr-red-border) !important; }
-
-  /* ── LinkedIn NOT SLOP trash can ── */
-  .not_slop_trash_btn {
-    position: absolute !important; top: 140px !important; right: 14px !important;
-    pointer-events: auto !important; background: var(--sr-bg) !important;
-    border: 1px solid var(--sr-border) !important; border-radius: 50% !important;
-    width: 28px !important; height: 28px !important;
-    display: flex !important; align-items: center !important; justify-content: center !important;
-    font-size: 0.85rem !important; cursor: pointer !important;
-    box-shadow: var(--sr-shadow) !important; z-index: 100000 !important;
-  }
-  .not_slop_trash_btn:hover { background: var(--sr-red-dim) !important; border-color: var(--sr-red-border) !important; }
 `;
 document.head.appendChild(slopStyle);
 
@@ -400,22 +439,6 @@ function openMessageAuthor(wrapper) {
   window.open(url, "_blank");
 }
 
-// ── Build dog-ear ─────────────────────────────────────────────────────────
-function buildDogEar(isSlop, confidence) {
-  const ear = document.createElement("div");
-  ear.className = isSlop ? "slop_dog_ear" : "not_slop_dog_ear";
-  const ribbon = document.createElement("div");
-  ribbon.className = isSlop ? "slop_dog_ear_ribbon" : "not_slop_ribbon";
-  const mainSpan = document.createElement("span");
-  mainSpan.textContent = isSlop ? "🚫 AI SLOP" : "NOT SLOP! 🫅";
-  const subSpan = document.createElement("span");
-  subSpan.className = "sr-sub";
-  subSpan.textContent = `${confidence}% certainty`;
-  ribbon.append(mainSpan, subSpan);
-  ear.appendChild(ribbon);
-  return ear;
-}
-
 // ── Apply SLOP ────────────────────────────────────────────────────────────
 function applySlop(wrapper, confidence) {
   if (evaluatedWrappers.has(wrapper)) return;
@@ -428,42 +451,34 @@ function applySlop(wrapper, confidence) {
 
   wrapper.classList.add("slop_radar_card", `slop_radar_${PLATFORM}`);
   wrapper.setAttribute("data-slop-detected", "true");
-  // Start collapsed (no data-sr-revealed)
   wrapper.removeAttribute("data-sr-revealed");
 
   if (window.getComputedStyle(wrapper).position === "static") {
     wrapper.style.setProperty("position", "relative", "important");
   }
-
   if (!IS_TWITTER) {
     killMedia(wrapper);
     wrapper.style.setProperty("overflow", "hidden", "important");
   }
 
-  // Mark blurable children BEFORE injecting our elements
-  // Twitter: we can't mutate React tree — instead we inject a sibling overlay div
-  if (IS_TWITTER) {
-    // Mark existing direct children as blurable via a wrapper div
-    // We create a single wrapper div that captures all existing children
-    const blurWrap = document.createElement("div");
-    blurWrap.className = "sr_blurable";
-    blurWrap.style.cssText = "display:contents"; // no layout impact
-    // Move all existing children into blurWrap
-    while (wrapper.firstChild) blurWrap.appendChild(wrapper.firstChild);
-    wrapper.appendChild(blurWrap);
-  } else {
-    // LinkedIn/universal: mark each existing child
-    Array.from(wrapper.children).forEach(ch => {
-      if (!ch.classList.contains("slop_dog_ear") && !ch.classList.contains("slop_radar_controls")) {
-        ch.classList.add("sr_blurable");
-      }
-    });
-  }
+  // ── Horizontal banner ──────────────────────────────────────────────────
+  const banner = document.createElement("div");
+  banner.className = "slop_dog_ear";
 
-  // Dog-ear
-  wrapper.appendChild(buildDogEar(true, confidence));
+  const ribbon = document.createElement("div");
+  ribbon.className = "slop_dog_ear_ribbon";
 
-  // Controls
+  const mainSpan = document.createElement("span");
+  mainSpan.className = "sr-main";
+  mainSpan.textContent = "🚫 AI SLOP";
+
+  const subSpan = document.createElement("span");
+  subSpan.className = "sr-sub";
+  subSpan.textContent = `${confidence}% certainty`;
+
+  ribbon.append(mainSpan, subSpan);
+
+  // Controls inside the banner (right side)
   const controls = document.createElement("div");
   controls.className = "slop_radar_controls";
 
@@ -488,12 +503,27 @@ function applySlop(wrapper, confidence) {
   if (IS_LINKEDIN && settings.showMessageAuthor) {
     const msgBtn = document.createElement("button");
     msgBtn.className = "slop_radar_btn sr-secondary";
-    msgBtn.textContent = "✉️ Nudge author";
+    msgBtn.textContent = "✉️ Nudge";
     msgBtn.addEventListener("click", (e) => { e.stopPropagation(); openMessageAuthor(wrapper); });
     controls.appendChild(msgBtn);
   }
 
-  wrapper.appendChild(controls);
+  banner.append(ribbon, controls);
+
+  // ── Blur cover (for Twitter full-height blur, LinkedIn uses max-height) ──
+  const blurCover = document.createElement("div");
+  blurCover.className = "sr_blur_cover";
+
+  // Insert banner at top, blur cover fills rest
+  wrapper.insertBefore(banner, wrapper.firstChild);
+  wrapper.appendChild(blurCover);
+
+  // After inserting banner, measure its height and set blur cover top
+  requestAnimationFrame(() => {
+    const h = banner.offsetHeight || 40;
+    blurCover.style.top = h + "px";
+  });
+
   recordResult(true);
 }
 
@@ -511,6 +541,7 @@ function applyNotSlop(wrapper, confidence) {
   }
 
   if (IS_TWITTER) {
+    // Twitter: inline pill next to timestamp
     if (wrapper.querySelector(".not_slop_tw_wrap")) return;
     const timeEl = wrapper.querySelector("time");
     if (timeEl?.parentElement) {
@@ -518,7 +549,7 @@ function applyNotSlop(wrapper, confidence) {
       wrap.className = "not_slop_tw_wrap";
       const badge = document.createElement("span");
       badge.className = "not_slop_tw_badge";
-      badge.textContent = `✓ NOT SLOP! 🫅 ${confidence}%`;
+      badge.textContent = `✓ NOT SLOP  ${confidence}%`;
       wrap.appendChild(badge);
       if (settings.showTrashCan) {
         const tb = document.createElement("button");
@@ -531,8 +562,22 @@ function applyNotSlop(wrapper, confidence) {
       timeEl.parentElement.insertAdjacentElement("afterend", wrap);
     }
   } else {
+    // LinkedIn/universal: bottom-right tag + adjacent trash can
     if (wrapper.querySelector(".not_slop_dog_ear")) return;
-    const ear = buildDogEar(false, confidence);
+
+    const ear = document.createElement("div");
+    ear.className = "not_slop_dog_ear";
+
+    const tag = document.createElement("span");
+    tag.className = "not_slop_ribbon";
+    const mainSpan = document.createElement("span");
+    mainSpan.textContent = "NOT SLOP";
+    const subSpan = document.createElement("span");
+    subSpan.className = "sr-sub";
+    subSpan.textContent = `${confidence}%`;
+    tag.append(mainSpan, subSpan);
+    ear.appendChild(tag);
+
     if (settings.showTrashCan) {
       const tb = document.createElement("button");
       tb.className = "not_slop_trash_btn"; tb.textContent = "🗑️";
@@ -541,6 +586,7 @@ function applyNotSlop(wrapper, confidence) {
       tb.addEventListener("click", (e) => { e.stopPropagation(); learnFromPost(postText, tb); });
       ear.appendChild(tb);
     }
+
     wrapper.appendChild(ear);
   }
   recordResult(false);

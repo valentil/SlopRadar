@@ -349,6 +349,7 @@ AUTHENTIC — classify as 0 ONLY if:
 - Makes a narrow, falsifiable claim with evidence
 - Is a genuine question with no performance attached
 - Contains domain-specific jargon used correctly and precisely (not for show)
+- Looks like a news article e.g. US Stocks extend gains, BREAKING, International geopolitics or market related
 
 Input Text:
 """
