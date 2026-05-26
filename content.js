@@ -3,35 +3,38 @@
 const IS_TWITTER = location.hostname.includes("x.com") || location.hostname.includes("twitter.com");
 const IS_LINKEDIN = location.hostname.includes("linkedin.com");
 const PAGE_HOSTNAME = location.hostname;
-const PLATFORM = IS_TWITTER ? "twitter" : "linkedin";
+const PLATFORM = IS_TWITTER ? "twitter" : IS_LINKEDIN ? "linkedin" : "universal";
 
-// ── Settings (loaded async, safe defaults until loaded) ───────────────────
+// ── Settings ──────────────────────────────────────────────────────────────
 let settings = {
-  darkMode: false,
-  showTrashCan: true,
-  showMessageAuthor: true,
-  minConfidence: 60,
+  darkMode: false, showTrashCan: true, showMessageAuthor: true,
+  minConfidence: 60, universalMode: true,
 };
+let isPaused = false;
 
 function loadSettings(cb) {
   chrome.runtime.sendMessage({ action: "getSettings" }, (s) => {
-    if (!chrome.runtime.lastError && s) settings = s;
+    if (!chrome.runtime.lastError && s) settings = { ...settings, ...s };
     if (cb) cb();
+  });
+  chrome.runtime.sendMessage({ action: "getPauseState" }, (res) => {
+    if (!chrome.runtime.lastError && res) isPaused = !!res.paused;
   });
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "settingsUpdated") {
-    settings = request.settings;
-    if (IS_TWITTER) applyTheme("dark");
-    else applyTheme(settings.darkMode ? "dark" : "light");
+    settings = { ...settings, ...request.settings };
+    applyTheme(IS_TWITTER ? "dark" : (settings.darkMode ? "dark" : "light"));
   }
-  if (request.action === "queueSize") {
-    currentQueueSize = request.size;
-  }
+  if (request.action === "queueSize") { currentQueueSize = request.size; }
   if (request.action === "getPageStats") {
     sendResponse({ pageStats, queueSize: currentQueueSize });
     return true;
+  }
+  if (request.action === "pauseStateChanged") {
+    isPaused = request.paused;
+    if (!isPaused) scheduleDrain();
   }
 });
 
@@ -47,23 +50,58 @@ window.addEventListener("beforeunload", () => {
   chrome.runtime.sendMessage({ action: "tabRefreshing", tabId: MY_TAB_ID }).catch(() => {});
 });
 
+// SPA nav flush
+let lastUrl = location.href;
+new MutationObserver(() => {
+  if (location.href !== lastUrl) {
+    lastUrl = location.href;
+    pendingNodes.length = 0;
+    targetedTextNodes.clear();
+    evaluatedWrappers.clear();
+    postCache.clear();
+    console.log("[SlopRadar] SPA nav — queue flushed");
+    chrome.runtime.sendMessage({ action: "tabRefreshing", tabId: MY_TAB_ID }).catch(() => {});
+  }
+}).observe(document, { childList: true, subtree: false });
+
 // ── Page stats ────────────────────────────────────────────────────────────
 const pageStats = { checked: 0, slop: 0 };
-
 function recordResult(isSlop) {
   pageStats.checked++;
   if (isSlop) pageStats.slop++;
   chrome.runtime.sendMessage({ action: "recordResult", hostname: PAGE_HOSTNAME, isSlop }).catch(() => {});
 }
 
-// ── Shared queue state ────────────────────────────────────────────────────
-let processingTimeout = null;
+// ── Post cache ────────────────────────────────────────────────────────────
+// WeakMap keyed on wrapper element — stores {text, isSlop, confidence}
+// so re-encountered wrappers (scroll back) are instantly re-stamped
+const postCache = new WeakMap();
+
+// ── Viewport-priority queue ───────────────────────────────────────────────
+let pendingNodes = [];
 const targetedTextNodes = new Set();
+const evaluatedWrappers = new WeakSet();
 const evaluatedLengths = new WeakMap();
 let currentQueueSize = 0;
+let processRafId = null;
+
+function viewportScore(el) {
+  try {
+    const rect = el.getBoundingClientRect();
+    const vh = window.innerHeight;
+    if (rect.top >= 0 && rect.bottom <= vh) return 0;
+    if (rect.top > vh) return rect.top - vh;
+    return Math.abs(rect.bottom) + 10000;
+  } catch (_) { return 99999; }
+}
+
+function sortPendingByViewport() {
+  pendingNodes.sort((a, b) => viewportScore(a.wrapper) - viewportScore(b.wrapper));
+}
+
+window.addEventListener("scroll", () => { sortPendingByViewport(); }, { passive: true });
 
 // ── Theme ─────────────────────────────────────────────────────────────────
-// Twitter is always dark; LinkedIn follows settings.darkMode
 function applyTheme(mode) {
   document.documentElement.setAttribute("data-sr-theme", mode);
 }
@@ -71,571 +109,406 @@ function applyTheme(mode) {
 // ── Styles ────────────────────────────────────────────────────────────────
 const slopStyle = document.createElement("style");
 slopStyle.textContent = `
-  /* ── CSS vars: light (LinkedIn default) ── */
   :root, [data-sr-theme="light"] {
-    --sr-bg: #ffffff;
-    --sr-bg2: #f3f4f6;
-    --sr-border: #e5e7eb;
-    --sr-text: #111827;
-    --sr-text2: #6b7280;
-    --sr-red: #e02424;
-    --sr-red-dim: rgba(224,36,36,0.06);
-    --sr-red-border: rgba(224,36,36,0.25);
-    --sr-green: #137333;
-    --sr-green-bg: #f0fdf4;
-    --sr-green-border: #86efac;
-    --sr-shadow: 0 1px 3px rgba(0,0,0,0.08);
-    --sr-btn-bg: #ffffff;
-    --sr-btn-hover: #f9fafb;
-    --sr-overlay-bg: rgba(255,255,255,0.97);
-    --sr-hud-bg: rgba(15,15,15,0.92);
-    --sr-hud-text: #e5e7eb;
-    --sr-hud-text2: #6b7280;
+    --sr-bg:#fff; --sr-border:#e5e7eb; --sr-text2:#6b7280;
+    --sr-red:#e02424; --sr-red-dim:rgba(224,36,36,0.07); --sr-red-border:rgba(224,36,36,0.3);
+    --sr-green:#137333; --sr-green-bg:#f0fdf4; --sr-green-border:#86efac;
+    --sr-shadow:0 1px 3px rgba(0,0,0,0.08);
+    --sr-btn-bg:#fff; --sr-btn-hover:#f3f4f6;
   }
-
-  /* ── CSS vars: dark (Twitter default, optional LinkedIn dark) ── */
   [data-sr-theme="dark"] {
-    --sr-bg: #16202a;
-    --sr-bg2: #1e2732;
-    --sr-border: #2f3336;
-    --sr-text: #e7e9ea;
-    --sr-text2: #71767b;
-    --sr-red: #f4212e;
-    --sr-red-dim: rgba(244,33,46,0.12);
-    --sr-red-border: rgba(244,33,46,0.35);
-    --sr-green: #00ba7c;
-    --sr-green-bg: rgba(0,186,124,0.1);
-    --sr-green-border: rgba(0,186,124,0.35);
-    --sr-shadow: 0 1px 4px rgba(0,0,0,0.35);
-    --sr-btn-bg: #1e2732;
-    --sr-btn-hover: #2f3336;
-    --sr-overlay-bg: rgba(22,32,42,0.97);
-    --sr-hud-bg: rgba(22,32,42,0.95);
-    --sr-hud-text: #e7e9ea;
-    --sr-hud-text2: #71767b;
+    --sr-bg:#16202a; --sr-border:#2f3336; --sr-text2:#71767b;
+    --sr-red:#f4212e; --sr-red-dim:rgba(244,33,46,0.13); --sr-red-border:rgba(244,33,46,0.4);
+    --sr-green:#00ba7c; --sr-green-bg:rgba(0,186,124,0.1); --sr-green-border:rgba(0,186,124,0.35);
+    --sr-shadow:0 1px 4px rgba(0,0,0,0.4);
+    --sr-btn-bg:#1e2732; --sr-btn-hover:#2a3441;
   }
 
   /* ── Card base ── */
-  .slop_radar_card {
-    position: relative !important;
-    overflow: visible !important;
-  }
+  .slop_radar_card { position: relative !important; }
 
-  /* ── Slop dog-ear container — mirrors NOT SLOP but red ── */
-  .slop_dog_ear {
+  /* ── Dog-ear (shared: slop=red, notslop=green) ── */
+  .slop_dog_ear, .not_slop_dog_ear {
     position: absolute !important;
-    top: -100px !important;
-    right: 0 !important;
-    width: 260px !important;
-    height: 260px !important;
+    top: -100px !important; right: 0 !important;
+    width: 260px !important; height: 260px !important;
     overflow: hidden !important;
     pointer-events: none !important;
     z-index: 99999 !important;
+  }
+  .slop_dog_ear_ribbon, .not_slop_ribbon {
+    position: absolute !important;
+    top: 50px !important; right: -65px !important; width: 360px !important;
+    padding: 11px 0 !important; text-align: center !important;
+    font-size: 1rem !important; font-weight: 900 !important;
+    transform: rotate(45deg) !important;
+    letter-spacing: 0.14rem !important; white-space: nowrap !important;
+    display: flex !important; flex-direction: column !important;
+    align-items: center !important; gap: 2px !important;
+    user-select: none !important; pointer-events: none !important;
+    color: #fff !important;
   }
   .slop_dog_ear_ribbon {
-    position: absolute !important;
-    top: 50px !important;
-    right: -65px !important;
-    width: 360px !important;
     background: var(--sr-red) !important;
-    color: #ffffff !important;
-    padding: 10px 0 !important;
-    text-align: center !important;
-    font-size: 0.95rem !important;
-    font-weight: 900 !important;
-    transform: rotate(45deg) !important;
-    letter-spacing: 0.14rem !important;
-    white-space: nowrap !important;
+    box-shadow: 0 4px 18px rgba(224,36,36,0.45) !important;
+  }
+  .not_slop_ribbon {
+    background: var(--sr-green) !important;
     box-shadow: 0 4px 14px rgba(0,0,0,0.28) !important;
-    pointer-events: none !important;
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: center !important;
-    gap: 0 !important;
-    user-select: none !important;
+  }
+  .slop_dog_ear_ribbon .sr-sub, .not_slop_ribbon .sr-sub {
+    font-size: 0.68rem !important; opacity: 0.88 !important;
+    font-weight: 700 !important; letter-spacing: 0.05rem !important;
   }
 
-  /* ── Controls bar — sits on card face below the dog-ear area ── */
+  /* ── TWITTER: blur via data-sr-revealed attribute ── */
+  .slop_radar_twitter[data-slop-detected="true"]:not([data-sr-revealed]) .sr_blurable {
+    filter: blur(7px) !important;
+    opacity: 0.22 !important;
+    pointer-events: none !important;
+    user-select: none !important;
+    transition: filter 0.2s, opacity 0.2s !important;
+  }
+  .slop_radar_twitter[data-slop-detected="true"][data-sr-revealed] .sr_blurable {
+    filter: none !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+  }
+
+  /* ── LINKEDIN: collapse ── */
+  .slop_radar_linkedin[data-slop-detected="true"]:not([data-sr-revealed]) {
+    max-height: 180px !important;
+    overflow: hidden !important;
+  }
+  .slop_radar_linkedin[data-slop-detected="true"][data-sr-revealed] {
+    max-height: 3000px !important; overflow: visible !important;
+  }
+  .slop_radar_linkedin[data-slop-detected="true"]:not([data-sr-revealed]) .sr_blurable {
+    opacity: 0.05 !important; filter: blur(6px) !important;
+    pointer-events: none !important;
+  }
+  .slop_radar_linkedin[data-slop-detected="true"][data-sr-revealed] .sr_blurable {
+    filter: none !important; opacity: 1 !important; pointer-events: auto !important;
+  }
+
+  /* ── UNIVERSAL: same as linkedin ── */
+  .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]) {
+    max-height: 160px !important; overflow: hidden !important;
+  }
+  .slop_radar_universal[data-slop-detected="true"][data-sr-revealed] {
+    max-height: 3000px !important; overflow: visible !important;
+  }
+  .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]) .sr_blurable {
+    opacity: 0.05 !important; filter: blur(6px) !important;
+    pointer-events: none !important;
+  }
+
+  /* ── Controls bar ── */
   .slop_radar_controls {
     position: absolute !important;
-    top: 0 !important;
-    left: 0 !important;
-    right: 0 !important;
-    height: 56px !important;
-    display: flex !important;
-    align-items: center !important;
-    gap: 10px !important;
-    padding: 0 16px !important;
-    z-index: 99998 !important;
-    pointer-events: auto !important;
-    box-sizing: border-box !important;
+    left: 12px !important; right: 12px !important; bottom: 8px !important;
+    display: flex !important; align-items: center !important; gap: 8px !important;
+    z-index: 100001 !important; pointer-events: auto !important;
   }
-  .slop_radar_conf_tag {
-    font-size: 0.65rem !important;
-    font-weight: 600 !important;
-    color: var(--sr-text2) !important;
-    flex-shrink: 0 !important;
-    user-select: none !important;
-    white-space: nowrap !important;
-  }
-  .slop_radar_actions {
-    display: flex !important;
-    align-items: center !important;
-    gap: 6px !important;
-    margin-left: auto !important;
-    flex-shrink: 0 !important;
+  /* Twitter controls: below the ribbon, right-aligned */
+  .slop_radar_twitter .slop_radar_controls {
+    top: 148px !important; bottom: auto !important;
+    left: auto !important; right: 12px !important;
+    flex-direction: column !important; align-items: flex-end !important;
   }
   .slop_radar_btn {
-    font-size: 0.65rem !important;
-    font-weight: 700 !important;
-    color: var(--sr-text2) !important;
-    cursor: pointer !important;
-    border: 1px solid var(--sr-border) !important;
-    border-radius: 5px !important;
-    padding: 3px 9px !important;
+    font-size: 0.72rem !important; font-weight: 800 !important;
+    color: #fff !important; cursor: pointer !important;
+    border: none !important; border-radius: 6px !important;
+    padding: 5px 12px !important;
+    background: var(--sr-red) !important;
+    pointer-events: auto !important; z-index: 100002 !important;
+    white-space: nowrap !important; transition: opacity 0.12s !important;
+    line-height: 1.5 !important; letter-spacing: 0.04rem !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+  }
+  .slop_radar_btn:hover { opacity: 0.85 !important; }
+  .slop_radar_btn.sr-secondary {
     background: var(--sr-btn-bg) !important;
-    letter-spacing: 0.03rem !important;
-    pointer-events: auto !important;
-    z-index: 100000 !important;
-    white-space: nowrap !important;
-    transition: background 0.12s !important;
-    line-height: 1.6 !important;
-  }
-  .slop_radar_btn:hover { background: var(--sr-btn-hover) !important; }
-  .slop_radar_btn.icon-only {
-    padding: 3px 7px !important;
-    font-size: 0.8rem !important;
-  }
-  .slop_radar_btn.msg-btn {
-    border-color: var(--sr-red-border) !important;
-    color: var(--sr-red) !important;
-  }
-  .slop_radar_btn.msg-btn:hover { background: var(--sr-red-dim) !important; }
-
-  /* ── Collapsed: hide everything below the controls bar ── */
-  [data-slop-detected="true"] {
-    max-height: 56px !important;
-    overflow: hidden !important;
-    transition: max-height 0.22s cubic-bezier(0.4,0,0.2,1) !important;
-  }
-  [data-slop-detected="true"].slop_expanded {
-    max-height: 3000px !important;
-    overflow: visible !important;
-  }
-
-  /* ── Media hidden while collapsed ── */
-  [data-slop-detected="true"]:not(.slop_expanded) img,
-  [data-slop-detected="true"]:not(.slop_expanded) video,
-  [data-slop-detected="true"]:not(.slop_expanded) canvas,
-  [data-slop-detected="true"]:not(.slop_expanded) iframe,
-  [data-slop-detected="true"]:not(.slop_expanded) [style*="background-image"] {
-    display: none !important;
-  }
-  /* Content blurred when expanded (scoped per-card via data-slop-id) */
-
-  /* ══════════════════════════════════════════════════
-     LINKEDIN — big corner ribbon for NOT SLOP
-  ══════════════════════════════════════════════════ */
-  .slop_radar_linkedin .not_slop_dog_ear {
-    position: absolute !important;
-    top: -100px !important;
-    right: 0 !important;
-    width: 260px !important;
-    height: 260px !important;
-    overflow: hidden !important;
-    pointer-events: none !important;
-    z-index: 99999 !important;
-  }
-  .slop_radar_linkedin .not_slop_ribbon {
-    position: absolute !important;
-    top: 50px !important;
-    right: -65px !important;
-    width: 360px !important;
-    background: var(--sr-green) !important;
-    color: #ffffff !important;
-    padding: 10px 0 !important;
-    text-align: center !important;
-    font-size: 0.95rem !important;
-    font-weight: 900 !important;
-    transform: rotate(45deg) !important;
-    letter-spacing: 0.12rem !important;
-    white-space: nowrap !important;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.28) !important;
-    pointer-events: none !important;
-    display: flex !important;
-    flex-direction: column !important;
-    align-items: center !important;
-    gap: 0 !important;
-    cursor: default !important;
-  }
-  /* Trash can sits in the dog ear, pointer-events enabled */
-  .slop_radar_linkedin .not_slop_dog_ear {
-    pointer-events: none !important;
-  }
-  .slop_radar_linkedin .not_slop_trash_btn {
-    position: absolute !important;
-    top: 138px !important;
-    right: 14px !important;
-    pointer-events: auto !important;
-    background: var(--sr-bg) !important;
+    color: var(--sr-text2) !important;
     border: 1px solid var(--sr-border) !important;
-    border-radius: 50% !important;
-    width: 26px !important;
-    height: 26px !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    font-size: 0.8rem !important;
-    cursor: pointer !important;
-    box-shadow: var(--sr-shadow) !important;
-    transition: background 0.12s !important;
-    z-index: 100000 !important;
+    box-shadow: none !important;
   }
-  .slop_radar_linkedin .not_slop_trash_btn:hover {
-    background: var(--sr-red-dim) !important;
-    border-color: var(--sr-red-border) !important;
+  .slop_radar_btn.sr-secondary:hover { background: var(--sr-btn-hover) !important; }
+
+  /* Twitter bigger buttons */
+  .slop_radar_twitter .slop_radar_btn {
+    font-size: 0.8rem !important; padding: 6px 14px !important;
   }
 
-  /* ══════════════════════════════════════════════════
-     TWITTER — card-style NOT SLOP pill
-  ══════════════════════════════════════════════════ */
-  .not_slop_tw_wrap {
-    display: inline-flex !important;
-    align-items: center !important;
-    gap: 4px !important;
-    margin-left: 6px !important;
-    vertical-align: middle !important;
-  }
+  /* ── NOT SLOP badge (Twitter) ── */
+  .not_slop_tw_wrap { display: inline-flex !important; align-items: center !important; gap: 4px !important; margin-left: 6px !important; vertical-align: middle !important; }
   .not_slop_tw_badge {
-    display: inline-flex !important;
-    align-items: center !important;
-    gap: 3px !important;
-    padding: 1px 7px !important;
-    background: var(--sr-green-bg) !important;
-    border: 1px solid var(--sr-green-border) !important;
-    border-radius: 999px !important;
-    font-size: 0.62rem !important;
-    font-weight: 800 !important;
-    color: var(--sr-green) !important;
-    letter-spacing: 0.05rem !important;
-    user-select: none !important;
-    white-space: nowrap !important;
-    pointer-events: none !important;
+    display: inline-flex !important; align-items: center !important; padding: 2px 8px !important;
+    background: var(--sr-green-bg) !important; border: 1px solid var(--sr-green-border) !important;
+    border-radius: 999px !important; font-size: 0.65rem !important; font-weight: 800 !important;
+    color: var(--sr-green) !important; white-space: nowrap !important; pointer-events: none !important;
   }
   .not_slop_tw_trash_btn {
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    width: 18px !important;
-    height: 18px !important;
-    border-radius: 50% !important;
-    border: 1px solid var(--sr-border) !important;
-    background: var(--sr-btn-bg) !important;
-    font-size: 0.65rem !important;
-    cursor: pointer !important;
-    pointer-events: auto !important;
-    transition: background 0.12s !important;
-    line-height: 1 !important;
+    display: inline-flex !important; align-items: center !important; justify-content: center !important;
+    width: 20px !important; height: 20px !important; border-radius: 50% !important;
+    border: 1px solid var(--sr-border) !important; background: var(--sr-btn-bg) !important;
+    font-size: 0.7rem !important; cursor: pointer !important; pointer-events: auto !important;
   }
-  .not_slop_tw_trash_btn:hover {
-    background: var(--sr-red-dim) !important;
-    border-color: var(--sr-red-border) !important;
-  }
+  .not_slop_tw_trash_btn:hover { background: var(--sr-red-dim) !important; border-color: var(--sr-red-border) !important; }
 
+  /* ── LinkedIn NOT SLOP trash can ── */
+  .not_slop_trash_btn {
+    position: absolute !important; top: 140px !important; right: 14px !important;
+    pointer-events: auto !important; background: var(--sr-bg) !important;
+    border: 1px solid var(--sr-border) !important; border-radius: 50% !important;
+    width: 28px !important; height: 28px !important;
+    display: flex !important; align-items: center !important; justify-content: center !important;
+    font-size: 0.85rem !important; cursor: pointer !important;
+    box-shadow: var(--sr-shadow) !important; z-index: 100000 !important;
+  }
+  .not_slop_trash_btn:hover { background: var(--sr-red-dim) !important; border-color: var(--sr-red-border) !important; }
 `;
 document.head.appendChild(slopStyle);
 
-
 // ── Modal guards ──────────────────────────────────────────────────────────
-const LINKEDIN_MODAL_SELECTORS = [
-  '[role="dialog"]', '[data-test-modal]', '[data-test-modal-container]',
-  '.artdeco-modal', '.artdeco-modal-overlay', '.share-box',
-  '.share-box-v2__modal', '.share-creation-state', '.artdeco-modal__content',
-  '.media-editor__container', '.share-box-footer',
+const LINKEDIN_MODAL_SEL = [
+  '[role="dialog"]','[data-test-modal]','[data-test-modal-container]',
+  '.artdeco-modal','.artdeco-modal-overlay','.share-box',
+  '.share-box-v2__modal','.share-creation-state','.artdeco-modal__content',
+  '.media-editor__container','.share-box-footer',
 ].join(',');
 
-const TWITTER_MODAL_SELECTORS = [
-  '[data-testid="tweetTextarea_0"]',
-  '[aria-label="Tweet text"]',
-  '[role="dialog"]',
-  '.DraftEditor-root',
+const TWITTER_MODAL_SEL = [
+  '[data-testid="tweetTextarea_0"]','[aria-label="Tweet text"]',
+  '[role="dialog"]','.DraftEditor-root',
 ].join(',');
 
-function isComposerOrInput(element) {
-  if (!element) return false;
-  const shared = 'input, textarea, [contenteditable="true"], [role="textbox"]';
-  const extra = IS_LINKEDIN ? `, ${LINKEDIN_MODAL_SELECTORS}` : IS_TWITTER ? `, ${TWITTER_MODAL_SELECTORS}` : '';
-  return !!element.closest(shared + extra);
+function isComposerOrInput(el) {
+  if (!el) return false;
+  const shared = 'input,textarea,[contenteditable="true"],[role="textbox"]';
+  const extra = IS_LINKEDIN ? `,${LINKEDIN_MODAL_SEL}` : IS_TWITTER ? `,${TWITTER_MODAL_SEL}` : '';
+  return !!el.closest(shared + extra);
 }
-
-function isInsideModal(element) {
-  if (!element) return false;
-  if (IS_LINKEDIN) return !!element.closest(LINKEDIN_MODAL_SELECTORS);
-  if (IS_TWITTER)  return !!element.closest(TWITTER_MODAL_SELECTORS);
+function isInsideModal(el) {
+  if (!el) return false;
+  if (IS_LINKEDIN) return !!el.closest(LINKEDIN_MODAL_SEL);
+  if (IS_TWITTER) return !!el.closest(TWITTER_MODAL_SEL);
   return false;
 }
 
 // ── Wrapper finders ───────────────────────────────────────────────────────
-// LinkedIn card detection — ordered from most-specific to most-general.
-// Strategy: try closest() with known card selectors first (fast, exact),
-// then walk upward collecting every candidate and return the outermost
-// one that is still a plausible feed card (not body/main/aside).
-
-const LI_CARD_SELECTORS = [
-  // Most specific — actual feed update containers
-  '[data-id]',                                   // promoted/sponsored posts
-  '[data-urn]',                                  // activity URN on post wrapper
-  '[data-activity-urn]',
-  '.feed-shared-update-v2',
-  '.occludable-update',
-  // Notification / suggested / entity cards
-  '.nt-card',
-  '.scaffold-finite-scroll__content > li',       // top-level feed <li>
-  '.feed-shared-update-v2__container',
-  // Generic fallbacks
-  'article',
-].join(', ');
-
-// Classes that indicate we are INSIDE a card's content, not at card level —
-// don't stop here, keep climbing.
-const LI_INNER_CLASSES = [
-  'feed-shared-update-v2__description',
-  'feed-shared-text',
-  'update-components-text',
-  'feed-shared-inline-show-more-text',
-  'attributed-text-segment-list',
-  'feed-shared-update-v2__content',
-  'update-components-update-v2',
-];
-
 function getLinkedInWrapper(textNode) {
   if (isInsideModal(textNode)) return null;
-
-  // ── Step 1: closest() fast path ──────────────────────────────────────
-  // Try each selector from specific to general; take the OUTERMOST match.
-  let best = null;
-  let el = textNode.parentElement;
-  while (el && el.tagName !== 'BODY' && el.tagName !== 'MAIN' && el.tagName !== 'ASIDE') {
-    if (el.matches && el.matches(LINKEDIN_MODAL_SELECTORS)) return null;
-
+  // Strategy A: direct closest on known card selectors
+  const cardSelectors = [
+    '[data-urn]','[data-activity-urn]','[data-id]',
+    '.feed-shared-update-v2','.occludable-update','.nt-card','article',
+  ];
+  for (const sel of cardSelectors) {
+    const found = textNode.closest(sel);
+    if (found && !isInsideModal(found)) {
+      const p = found.parentElement;
+      if (p && (p.tagName === 'LI' || (p.className||'').toLowerCase().includes('item-wrapper'))) return p;
+      return found;
+    }
+  }
+  // Strategy B: walk up 20 levels collecting outermost card-like el
+  const INNER = ['__description','__text','__content','segment-list','inline-show'];
+  let el = textNode.parentElement, best = null, depth = 0;
+  while (el && el.tagName !== 'BODY' && el.tagName !== 'MAIN' && depth < 20) {
+    if (el.matches?.(LINKEDIN_MODAL_SEL)) return null;
     const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
     const hasUrn = el.hasAttribute('data-urn') || el.hasAttribute('data-activity-urn') || el.hasAttribute('data-id');
-
-    // Definitive card signals — these are always the right wrapper
-    const isDefinitiveCard = (
-      hasUrn ||
-      cls.includes('feed-shared-update-v2') && !cls.includes('__') ||  // root, not modifier
-      cls.includes('occludable-update') ||
-      cls.includes('nt-card') ||
-      el.tagName === 'LI' && el.closest('.scaffold-finite-scroll__content, .feed-container, [data-finite-scroll-hotspot]')
-    );
-
-    if (isDefinitiveCard) {
-      best = el;  // keep climbing — want outermost definitive card
-    } else if (!best) {
-      // Weaker signal — only accept if we haven't found a definitive card yet
-      const isWeakCard = (
-        el.tagName === 'ARTICLE' ||
-        cls.includes('card') && !cls.includes('card__') ||
-        cls.includes('update') && !LI_INNER_CLASSES.some(c => cls.includes(c)) ||
-        cls.includes('timeline-item') ||
-        cls.includes('feed-item')
-      );
-      if (isWeakCard) best = el;
+    const isInner = INNER.some(c => cls.includes(c));
+    if (!isInner && (hasUrn || cls.includes('occludable') || cls.includes('feed-shared-update-v2') || cls.includes('nt-card') || el.tagName === 'ARTICLE' || el.tagName === 'LI')) {
+      best = el;
     }
-
-    el = el.parentElement;
+    el = el.parentElement; depth++;
   }
-
-  if (!best) return null;
-
-  // ── Step 2: bubble up one more level through transparent wrappers ─────
-  // e.g. <div class="occludable-update"> is often inside <li> or a
-  // data-finite-scroll item — grab that if it adds nothing of its own.
-  const parent = best.parentElement;
-  if (parent && parent.tagName !== 'BODY' && parent.tagName !== 'MAIN') {
-    const pcls = (typeof parent.className === 'string' ? parent.className : '').toLowerCase();
-    if (
-      parent.tagName === 'LI' ||
-      pcls.includes('item-wrapper') ||
-      pcls.includes('feed-item') ||
-      pcls.includes('scaffold-finite-scroll')
-    ) {
-      best = parent;
-    }
+  // Strategy C: 8-level hard climb
+  if (!best) {
+    let fb = textNode.parentElement;
+    for (let i = 0; i < 8 && fb && fb.tagName !== 'BODY'; i++) fb = fb.parentElement;
+    best = fb;
   }
-
-  if (isInsideModal(best)) return null;
+  if (!best || isInsideModal(best)) return null;
   return best;
 }
 
 function getTwitterWrapper(textNode) {
   if (isInsideModal(textNode)) return null;
-  const article = textNode.closest('article[data-testid="tweet"]');
-  if (!article || isInsideModal(article)) return null;
-  return article;
+  const art = textNode.closest('article[data-testid="tweet"]');
+  if (!art || isInsideModal(art)) return null;
+  return art;
+}
+
+function getUniversalWrapper(textNode) {
+  // Walk up to find a block-level container with enough text
+  let el = textNode.parentElement;
+  for (let i = 0; i < 10 && el && el.tagName !== 'BODY'; i++) {
+    const tag = el.tagName;
+    if (['P','ARTICLE','SECTION','LI','BLOCKQUOTE','DIV'].includes(tag)) {
+      const text = el.textContent?.trim() || '';
+      if (text.length >= 80) return el;
+    }
+    el = el.parentElement;
+  }
+  return null;
 }
 
 function getPostWrapper(textNode) {
-  return IS_TWITTER ? getTwitterWrapper(textNode) : getLinkedInWrapper(textNode);
+  if (IS_TWITTER) return getTwitterWrapper(textNode);
+  if (IS_LINKEDIN) return getLinkedInWrapper(textNode);
+  return getUniversalWrapper(textNode);
 }
 
 // ── Media kill ────────────────────────────────────────────────────────────
-function killMediaElements(container) {
-  container.querySelectorAll("video, iframe, audio, source").forEach(media => {
-    try { media.pause(); } catch (e) {}
-    media.src = "";
-    media.removeAttribute("src");
-    if (typeof media.load === "function") media.load();
-    media.remove();
+function killMedia(container) {
+  container.querySelectorAll("video,iframe,audio,source").forEach(m => {
+    try { m.pause(); } catch (_) {}
+    m.src = ""; m.removeAttribute("src");
+    if (typeof m.load === "function") m.load();
+    m.remove();
   });
 }
 
-// ── Learn action (trash can) ──────────────────────────────────────────────
+// ── Learn ────────────────────────────────────────────────────────────────
 function learnFromPost(postText, btn) {
-  btn.textContent = "⏳";
-  btn.disabled = true;
+  btn.textContent = "⏳"; btn.disabled = true;
   chrome.runtime.sendMessage({ action: "learnFromSlop", postText }, (res) => {
-    if (chrome.runtime.lastError || !res?.ok) {
-      btn.textContent = "🗑️";
-      btn.disabled = false;
-      return;
-    }
-    const count = res.newPatterns?.length ?? 0;
-    btn.textContent = count > 0 ? `✓ +${count}` : "✓";
-    btn.title = count > 0
-      ? `Learned ${count} new pattern${count > 1 ? "s" : ""}`
-      : "No new patterns found (already covered)";
+    if (chrome.runtime.lastError || !res?.ok) { btn.textContent = "🗑️"; btn.disabled = false; return; }
+    const n = res.newPatterns?.length ?? 0;
+    btn.textContent = n > 0 ? `✓ +${n}` : "✓";
+    btn.title = n > 0 ? `Learned ${n} new patterns` : "Already covered";
   });
 }
 
-// ── Message author (LinkedIn only) ───────────────────────────────────────
-function getLinkedInMessageUrl(wrapper) {
-  // Try to find the profile link of the post author
-  const authorLink = wrapper.querySelector(
-    'a[href*="/in/"], a[href*="/company/"], .update-components-actor__meta a'
-  );
-  if (!authorLink) return null;
-  const href = authorLink.getAttribute("href") || "";
-  const match = href.match(/\/in\/([^/?#]+)/);
-  if (!match) return null;
-  const profileSlug = match[1];
-  return `https://www.linkedin.com/messaging/compose/?to=${encodeURIComponent(profileSlug)}`;
-}
-
-const NUDGE_MESSAGE = encodeURIComponent(
+// ── Message author ────────────────────────────────────────────────────────
+const NUDGE_MSG = encodeURIComponent(
   `Hey! I noticed your post was caught by SlopRadar — a browser extension that filters AI-generated filler content from feeds.\n\n` +
   `No hard feelings at all — just wanted to share: your audience LOVES hearing the real stuff. What are you actually building? ` +
   `What did you ship this week? A raw screenshot, a quick lesson learned, a specific number — that stuff cuts through so much better.\n\n` +
-  `Check out SlopRadar if you're curious: https://github.com/featureboard/slopradar\n\n` +
-  `Keep building! 🚀`
+  `Check out SlopRadar: https://github.com/featureboard/slopradar\n\nKeep building! 🚀`
 );
-
 function openMessageAuthor(wrapper) {
-  const url = getLinkedInMessageUrl(wrapper);
-  if (url) {
-    window.open(`${url}&body=${NUDGE_MESSAGE}`, "_blank");
-  } else {
-    // Fallback: open generic compose
-    window.open(`https://www.linkedin.com/messaging/compose/?body=${NUDGE_MESSAGE}`, "_blank");
-  }
+  const link = wrapper.querySelector('a[href*="/in/"],.update-components-actor__meta a');
+  const m = (link?.getAttribute("href") || "").match(/\/in\/([^/?#]+)/);
+  const url = m
+    ? `https://www.linkedin.com/messaging/compose/?to=${encodeURIComponent(m[1])}&body=${NUDGE_MSG}`
+    : `https://www.linkedin.com/messaging/compose/?body=${NUDGE_MSG}`;
+  window.open(url, "_blank");
+}
+
+// ── Build dog-ear ─────────────────────────────────────────────────────────
+function buildDogEar(isSlop, confidence) {
+  const ear = document.createElement("div");
+  ear.className = isSlop ? "slop_dog_ear" : "not_slop_dog_ear";
+  const ribbon = document.createElement("div");
+  ribbon.className = isSlop ? "slop_dog_ear_ribbon" : "not_slop_ribbon";
+  const mainSpan = document.createElement("span");
+  mainSpan.textContent = isSlop ? "🚫 AI SLOP" : "NOT SLOP! 🫅";
+  const subSpan = document.createElement("span");
+  subSpan.className = "sr-sub";
+  subSpan.textContent = `${confidence}% certainty`;
+  ribbon.append(mainSpan, subSpan);
+  ear.appendChild(ribbon);
+  return ear;
 }
 
 // ── Apply SLOP ────────────────────────────────────────────────────────────
 function applySlop(wrapper, confidence) {
+  if (evaluatedWrappers.has(wrapper)) return;
+  if (wrapper.querySelector(".slop_dog_ear")) return;
   wrapper.querySelector(".not_slop_dog_ear")?.remove();
   wrapper.querySelector(".not_slop_tw_wrap")?.remove();
-  if (wrapper.querySelector(".slop_dog_ear")) return; // already stamped
+
+  evaluatedWrappers.add(wrapper);
+  postCache.set(wrapper, { isSlop: true, confidence });
 
   wrapper.classList.add("slop_radar_card", `slop_radar_${PLATFORM}`);
-  wrapper.querySelectorAll("[data-slop-detected]").forEach(child => {
-    child.removeAttribute("data-slop-detected");
-    child.querySelector(".slop_dog_ear")?.remove();
-    child.querySelector(".slop_radar_controls")?.remove();
-  });
-
-  killMediaElements(wrapper);
   wrapper.setAttribute("data-slop-detected", "true");
+  // Start collapsed (no data-sr-revealed)
+  wrapper.removeAttribute("data-sr-revealed");
 
-  // Force positioning context so absolute children land correctly
-  const pos = window.getComputedStyle(wrapper).position;
-  if (pos === "static") wrapper.style.setProperty("position", "relative", "important");
-  // Override any explicit height LinkedIn sets so max-height collapse works
-  wrapper.style.setProperty("overflow", "hidden", "important");
+  if (window.getComputedStyle(wrapper).position === "static") {
+    wrapper.style.setProperty("position", "relative", "important");
+  }
 
-  // Scoped blur when expanded — confidence-driven
-  const uid = `sr_${Math.random().toString(36).slice(2, 8)}`;
-  wrapper.dataset.slopId = uid;
-  const blurStyle = document.createElement("style");
-  blurStyle.dataset.slopBlurFor = uid;
-  const opacity = Math.max(0.03, 1 - confidence / 100).toFixed(2);
-  const blurPx = Math.round(confidence * 0.14);
-  blurStyle.textContent = `
-    [data-slop-id="${uid}"].slop_expanded > :not(.slop_dog_ear):not(.slop_radar_controls) {
-      opacity: ${opacity} !important;
-      filter: blur(${blurPx}px) grayscale(0.4) !important;
-    }
-  `;
-  document.head.appendChild(blurStyle);
+  if (!IS_TWITTER) {
+    killMedia(wrapper);
+    wrapper.style.setProperty("overflow", "hidden", "important");
+  }
 
-  const postText = wrapper.textContent?.trim().substring(0, 800) || "";
+  // Mark blurable children BEFORE injecting our elements
+  // Twitter: we can't mutate React tree — instead we inject a sibling overlay div
+  if (IS_TWITTER) {
+    // Mark existing direct children as blurable via a wrapper div
+    // We create a single wrapper div that captures all existing children
+    const blurWrap = document.createElement("div");
+    blurWrap.className = "sr_blurable";
+    blurWrap.style.cssText = "display:contents"; // no layout impact
+    // Move all existing children into blurWrap
+    while (wrapper.firstChild) blurWrap.appendChild(wrapper.firstChild);
+    wrapper.appendChild(blurWrap);
+  } else {
+    // LinkedIn/universal: mark each existing child
+    Array.from(wrapper.children).forEach(ch => {
+      if (!ch.classList.contains("slop_dog_ear") && !ch.classList.contains("slop_radar_controls")) {
+        ch.classList.add("sr_blurable");
+      }
+    });
+  }
 
-  // ── Dog-ear ribbon (red, mirrors NOT SLOP) ────────────────────────────
-  const dogEar = document.createElement("div");
-  dogEar.className = "slop_dog_ear";
+  // Dog-ear
+  wrapper.appendChild(buildDogEar(true, confidence));
 
-  const ribbon = document.createElement("div");
-  ribbon.className = "slop_dog_ear_ribbon";
-  ribbon.innerHTML = `<span>🚫 AI SLOP</span><span style="font-size:0.7rem;opacity:0.85;font-weight:700;letter-spacing:0.05rem">${confidence}% certainty</span>`;
-  dogEar.appendChild(ribbon);
-
-  // ── Controls bar — sits at top of card face ───────────────────────────
+  // Controls
   const controls = document.createElement("div");
   controls.className = "slop_radar_controls";
-
-  const conf = document.createElement("span");
-  conf.className = "slop_radar_conf_tag";
-  // spacer so buttons go right
-
-  const actions = document.createElement("div");
-  actions.className = "slop_radar_actions";
 
   const showBtn = document.createElement("button");
   showBtn.className = "slop_radar_btn";
   showBtn.textContent = "Show anyway";
   showBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    const expanded = wrapper.classList.toggle("slop_expanded");
-    showBtn.textContent = expanded ? "Collapse" : "Show anyway";
-    // Allow card to grow when expanded
-    wrapper.style.setProperty("overflow", expanded ? "visible" : "hidden", "important");
+    const revealed = wrapper.hasAttribute("data-sr-revealed");
+    if (revealed) {
+      wrapper.removeAttribute("data-sr-revealed");
+      showBtn.textContent = "Show anyway";
+      if (!IS_TWITTER) wrapper.style.setProperty("overflow", "hidden", "important");
+    } else {
+      wrapper.setAttribute("data-sr-revealed", "1");
+      showBtn.textContent = "Collapse";
+      if (!IS_TWITTER) wrapper.style.setProperty("overflow", "visible", "important");
+    }
   });
-  actions.appendChild(showBtn);
+  controls.appendChild(showBtn);
 
   if (IS_LINKEDIN && settings.showMessageAuthor) {
     const msgBtn = document.createElement("button");
-    msgBtn.className = "slop_radar_btn msg-btn icon-only";
-    msgBtn.textContent = "✉️";
-    msgBtn.title = "Message author a friendly nudge";
+    msgBtn.className = "slop_radar_btn sr-secondary";
+    msgBtn.textContent = "✉️ Nudge author";
     msgBtn.addEventListener("click", (e) => { e.stopPropagation(); openMessageAuthor(wrapper); });
-    actions.appendChild(msgBtn);
+    controls.appendChild(msgBtn);
   }
 
-  controls.append(conf, actions);
-  wrapper.appendChild(dogEar);
   wrapper.appendChild(controls);
-
   recordResult(true);
 }
 
 // ── Apply NOT SLOP ────────────────────────────────────────────────────────
 function applyNotSlop(wrapper, confidence) {
+  if (evaluatedWrappers.has(wrapper)) return;
   if (wrapper.getAttribute("data-slop-detected") === "true") return;
-  if (wrapper.querySelector(".slop_radar_overlay")) return;
+
+  evaluatedWrappers.add(wrapper);
+  postCache.set(wrapper, { isSlop: false, confidence });
 
   wrapper.classList.add("slop_radar_card", `slop_radar_${PLATFORM}`);
-
-  const postText = wrapper.textContent?.trim().substring(0, 800) || "";
+  if (window.getComputedStyle(wrapper).position === "static") {
+    wrapper.style.setProperty("position", "relative", "important");
+  }
 
   if (IS_TWITTER) {
     if (wrapper.querySelector(".not_slop_tw_wrap")) return;
@@ -643,180 +516,156 @@ function applyNotSlop(wrapper, confidence) {
     if (timeEl?.parentElement) {
       const wrap = document.createElement("span");
       wrap.className = "not_slop_tw_wrap";
-
       const badge = document.createElement("span");
       badge.className = "not_slop_tw_badge";
       badge.textContent = `✓ NOT SLOP! 🫅 ${confidence}%`;
-
       wrap.appendChild(badge);
-
       if (settings.showTrashCan) {
-        const trashBtn = document.createElement("button");
-        trashBtn.className = "not_slop_tw_trash_btn";
-        trashBtn.textContent = "🗑️";
-        trashBtn.title = "Actually slop? Teach SlopRadar";
-        trashBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          learnFromPost(postText, trashBtn);
-        });
-        wrap.appendChild(trashBtn);
+        const tb = document.createElement("button");
+        tb.className = "not_slop_tw_trash_btn"; tb.textContent = "🗑️";
+        tb.title = "Actually slop? Teach SlopRadar";
+        const postText = wrapper.textContent?.trim().substring(0, 800) || "";
+        tb.addEventListener("click", (e) => { e.stopPropagation(); learnFromPost(postText, tb); });
+        wrap.appendChild(tb);
       }
-
       timeEl.parentElement.insertAdjacentElement("afterend", wrap);
     }
   } else {
-    // LinkedIn — big dog ear ribbon
     if (wrapper.querySelector(".not_slop_dog_ear")) return;
-
-    // Ensure positioning context
-    const pos = window.getComputedStyle(wrapper).position;
-    if (pos === "static") wrapper.style.setProperty("position", "relative", "important");
-
-    const dogEar = document.createElement("div");
-    dogEar.className = "not_slop_dog_ear";
-
-    const ribbon = document.createElement("div");
-    ribbon.className = "not_slop_ribbon";
-    ribbon.innerHTML = `<span>NOT SLOP! 🫅</span><span style="font-size:0.7rem;opacity:0.82;font-weight:700;letter-spacing:0.06rem">${confidence}%</span>`;
-
-    dogEar.appendChild(ribbon);
-
+    const ear = buildDogEar(false, confidence);
     if (settings.showTrashCan) {
-      const trashBtn = document.createElement("button");
-      trashBtn.className = "not_slop_trash_btn";
-      trashBtn.textContent = "🗑️";
-      trashBtn.title = "Actually slop? Teach SlopRadar";
-      trashBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        learnFromPost(postText, trashBtn);
-      });
-      dogEar.appendChild(trashBtn);
+      const tb = document.createElement("button");
+      tb.className = "not_slop_trash_btn"; tb.textContent = "🗑️";
+      tb.title = "Actually slop? Teach SlopRadar";
+      const postText = wrapper.textContent?.trim().substring(0, 800) || "";
+      tb.addEventListener("click", (e) => { e.stopPropagation(); learnFromPost(postText, tb); });
+      ear.appendChild(tb);
     }
-
-    wrapper.appendChild(dogEar);
+    wrapper.appendChild(ear);
   }
-
   recordResult(false);
 }
 
-// ── Core evaluation loop ──────────────────────────────────────────────────
-function processTrackedContainers() {
-  if (targetedTextNodes.size === 0) return;
-
-  targetedTextNodes.forEach((textNode) => {
-    targetedTextNodes.delete(textNode);
-    if (isComposerOrInput(textNode)) return;
-
-    const rawText = (textNode.textContent || "").trim();
-    if (rawText.length < 40) return;
-    if (evaluatedLengths.get(textNode) === rawText.length) return;
-    evaluatedLengths.set(textNode, rawText.length);
-
-    // Resolve wrapper NOW while DOM is fresh, not after async delay
-    const wrapper = getPostWrapper(textNode);
-    if (!wrapper || isComposerOrInput(wrapper)) {
-      console.log("[SlopRadar] No wrapper found for text:", rawText.substring(0, 60));
-      return;
-    }
-    // Skip if already stamped
-    if (wrapper.querySelector(".slop_dog_ear") || wrapper.querySelector(".not_slop_dog_ear")) return;
-
-    console.log("[SlopRadar] Evaluating:", rawText.substring(0, 60), "| wrapper:", wrapper.tagName, wrapper.className?.substring?.(0,60));
-
-    chrome.runtime.sendMessage(
-      { action: "evaluatePost", text: rawText.substring(0, 1500), tabId: MY_TAB_ID },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          console.log("[SlopRadar] Message error:", chrome.runtime.lastError.message);
-          return;
-        }
-        const confidence = response?.confidence ?? 50;
-        console.log("[SlopRadar] Result: isSlop=", response?.isSlop, "conf=", confidence);
-        if (response?.isSlop) applySlop(wrapper, confidence);
-        else if (response) applyNotSlop(wrapper, confidence);
-      }
-    );
-  });
-}
-
-// ── Node queuing ──────────────────────────────────────────────────────────
+// ── Text selectors ────────────────────────────────────────────────────────
 function getTextSelectors() {
   if (IS_TWITTER) return '[data-testid="tweetText"]';
-  // LinkedIn: post body text lives in these containers
-  return [
+  if (IS_LINKEDIN) return [
+    // Modern LinkedIn selectors
+    '.update-components-text',
     '.feed-shared-update-v2__description-wrapper',
     '.feed-shared-text-view',
     '.feed-shared-inline-show-more-text',
-    '.update-components-text',
     '.attributed-text-segment-list__content',
-    // Fallback: any span with substantial dir=ltr inside a feed card
-    '.feed-shared-update-v2 span[dir="ltr"]',
+    // Broader fallback — any span with dir=ltr inside a feed card
+    '[data-finite-scroll-hotspot] span[dir="ltr"]',
+    '.scaffold-finite-scroll__content span[dir="ltr"]',
     '.occludable-update span[dir="ltr"]',
-  ].join(', ');
+    '.feed-shared-update-v2 span[dir="ltr"]',
+  ].join(',');
+  // Universal: any paragraph-length text block
+  return 'p, [class*="post"] p, [class*="content"] p, article p';
 }
 
-function nodeMatchesTextSelector(node) {
-  if (!node.matches) return false;
-  const sel = getTextSelectors();
-  return node.matches(sel);
+// ── Drain loop ────────────────────────────────────────────────────────────
+let draining = false;
+
+async function drainOne() {
+  if (isPaused || pendingNodes.length === 0) { draining = false; return; }
+  draining = true;
+
+  const item = pendingNodes.shift();
+  currentQueueSize = pendingNodes.length;
+  const { textNode, wrapper } = item;
+
+  if (evaluatedWrappers.has(wrapper) || !document.contains(wrapper)) {
+    requestAnimationFrame(drainOne); return;
+  }
+
+  // Cache hit — re-apply instantly without inference
+  if (postCache.has(wrapper)) {
+    const cached = postCache.get(wrapper);
+    if (cached.isSlop) applySlop(wrapper, cached.confidence);
+    else applyNotSlop(wrapper, cached.confidence);
+    requestAnimationFrame(drainOne); return;
+  }
+
+  const rawText = (textNode.textContent || "").trim();
+  if (rawText.length < 40 || evaluatedLengths.get(wrapper) === rawText.length) {
+    requestAnimationFrame(drainOne); return;
+  }
+  evaluatedLengths.set(wrapper, rawText.length);
+
+  console.log(`[SlopRadar] Q:${pendingNodes.length} "${rawText.substring(0,50)}…"`);
+
+  chrome.runtime.sendMessage(
+    { action: "evaluatePost", text: rawText.substring(0, 1500), tabId: MY_TAB_ID },
+    (response) => {
+      if (chrome.runtime.lastError) { requestAnimationFrame(drainOne); return; }
+      const confidence = response?.confidence ?? 50;
+      if (response?.isSlop) applySlop(wrapper, confidence);
+      else if (response) applyNotSlop(wrapper, confidence);
+      requestAnimationFrame(drainOne);
+    }
+  );
+}
+
+function scheduleDrain() {
+  if (!draining && !isPaused && pendingNodes.length > 0) {
+    draining = true;
+    requestAnimationFrame(drainOne);
+  }
+}
+
+// ── Enqueue ───────────────────────────────────────────────────────────────
+function enqueueNode(textNode) {
+  if (targetedTextNodes.has(textNode)) return;
+  if (isComposerOrInput(textNode)) return;
+  const rawText = (textNode.textContent || "").trim();
+  if (rawText.length < 40) return;
+
+  const wrapper = getPostWrapper(textNode);
+  if (!wrapper || isComposerOrInput(wrapper)) return;
+  if (evaluatedWrappers.has(wrapper)) return;
+
+  targetedTextNodes.add(textNode);
+  pendingNodes.push({ textNode, wrapper });
 }
 
 function queueContainerCheck(node) {
   if (node.nodeType !== Node.ELEMENT_NODE) return;
   if (isComposerOrInput(node)) return;
-
-  // Skip our own injected elements
-  if (node.classList?.contains("slop_dog_ear") ||
-      node.classList?.contains("slop_radar_controls") ||
-      node.classList?.contains("not_slop_dog_ear")) return;
+  if (node.classList?.contains("slop_dog_ear") || node.classList?.contains("not_slop_dog_ear") ||
+      node.classList?.contains("slop_radar_controls") || node.classList?.contains("not_slop_tw_wrap") ||
+      node.classList?.contains("sr_blurable")) return;
 
   if (IS_TWITTER) {
-    const testId = node.dataset?.testid || "";
-    if (testId === "tweetText") {
-      if (!isComposerOrInput(node)) targetedTextNodes.add(node);
-    } else {
-      node.querySelectorAll('[data-testid="tweetText"]').forEach(el => {
-        if (!isComposerOrInput(el)) targetedTextNodes.add(el);
-      });
-    }
+    if (node.dataset?.testid === "tweetText") enqueueNode(node);
+    else node.querySelectorAll('[data-testid="tweetText"]').forEach(enqueueNode);
   } else {
-    // LinkedIn: check if this node itself is a text container
-    if (nodeMatchesTextSelector(node)) {
-      if (!isComposerOrInput(node)) targetedTextNodes.add(node);
-    }
-    // Also scan inside for text containers
-    node.querySelectorAll(getTextSelectors()).forEach(el => {
-      if (!isComposerOrInput(el)) targetedTextNodes.add(el);
-    });
+    const sel = getTextSelectors();
+    if (node.matches?.(sel)) enqueueNode(node);
+    node.querySelectorAll(sel).forEach(enqueueNode);
   }
 }
 
 // ── MutationObserver ──────────────────────────────────────────────────────
-const observer = new MutationObserver((mutations) => {
-  let hasInjections = false;
-  for (const mutation of mutations) {
-    for (const added of mutation.addedNodes) {
-      queueContainerCheck(added);
-      hasInjections = true;
-    }
+const feedObserver = new MutationObserver((mutations) => {
+  let added = false;
+  for (const m of mutations) {
+    for (const n of m.addedNodes) { queueContainerCheck(n); added = true; }
   }
-  if (hasInjections) {
-    clearTimeout(processingTimeout);
-    processingTimeout = setTimeout(processTrackedContainers, 200);
-  }
+  if (added) { sortPendingByViewport(); scheduleDrain(); }
 });
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
 loadSettings(() => {
-  // Apply theme immediately
   applyTheme(IS_TWITTER ? "dark" : (settings.darkMode ? "dark" : "light"));
 
-  // Seed queue with existing nodes
   document.querySelectorAll(getTextSelectors()).forEach(node => {
-    if (!isComposerOrInput(node)) targetedTextNodes.add(node);
+    if (!isComposerOrInput(node)) enqueueNode(node);
   });
-  if (targetedTextNodes.size > 0) processTrackedContainers();
+  sortPendingByViewport();
+  scheduleDrain();
 
-  // Watch for new content
-  observer.observe(document.body, { childList: true, subtree: true });
+  feedObserver.observe(document.body, { childList: true, subtree: true });
 });

@@ -55,7 +55,8 @@ const DEFAULT_SETTINGS = {
   darkMode: false,
   showTrashCan: true,
   showMessageAuthor: true,
-  minConfidence: 60, // only hide if confidence >= this
+  minConfidence: 60,
+  universalMode: true, // scan any page, not just LinkedIn/X
 };
 
 // ── Storage helpers ───────────────────────────────────────────────────────
@@ -64,6 +65,41 @@ function storageGet(keys) {
 }
 function storageSet(obj) {
   return new Promise(resolve => chrome.storage.local.set(obj, resolve));
+}
+
+// ── Pause state ──────────────────────────────────────────────────────────
+let pausedState = false;
+
+async function getPauseState() {
+  const d = await storageGet(["paused"]);
+  pausedState = !!d.paused;
+  return pausedState;
+}
+
+async function setPauseState(paused) {
+  pausedState = paused;
+  await storageSet({ paused });
+  // Update badge
+  const tabs = await new Promise(r => chrome.tabs.query({}, r));
+  for (const tab of tabs) {
+    if (tab.id && isSupportedUrl(tab.url || "")) {
+      chrome.tabs.sendMessage(tab.id, { action: "pauseStateChanged", paused }).catch(() => {});
+    }
+  }
+  // Reflect in extension icon title
+  chrome.action.setTitle({ title: paused ? "SlopRadar — Paused" : "SlopRadar — Active" });
+  if (paused) {
+    // Show P badge on all active tabs
+    tabs.filter(t => isSupportedUrl(t.url || "")).forEach(t => {
+      chrome.action.setBadgeText({ text: "⏸", tabId: t.id });
+      chrome.action.setBadgeBackgroundColor({ color: "#6b7280", tabId: t.id });
+    });
+  } else {
+    tabs.filter(t => isSupportedUrl(t.url || "")).forEach(t => {
+      chrome.action.setBadgeText({ text: "ON", tabId: t.id });
+      chrome.action.setBadgeBackgroundColor({ color: "#e02424", tabId: t.id });
+    });
+  }
 }
 
 async function getPatterns() {
@@ -259,7 +295,7 @@ function broadcastQueueSize() {
 }
 
 async function drainQueue() {
-  if (draining || !aiSession) return;
+  if (draining || !aiSession || pausedState) return;
   draining = true;
 
   while (queue.length > 0) {
@@ -422,6 +458,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === "compactPatterns") {
     maybeCompactPatterns().then(() => getPatterns()).then(p => sendResponse({ ok: true, patterns: p }));
+    return true;
+  }
+
+  if (request.action === "getPauseState") {
+    getPauseState().then(paused => sendResponse({ paused }));
+    return true;
+  }
+
+  if (request.action === "setPauseState") {
+    setPauseState(request.paused).then(() => sendResponse({ ok: true }));
     return true;
   }
 

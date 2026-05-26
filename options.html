@@ -244,6 +244,8 @@
     background: #9ca3af;
   }
   .queue-pill.active .qdot { background: #fbbf24; animation: pulse 1.2s infinite; }
+  #pause-btn:hover { background: rgba(255,255,255,0.22) !important; }
+  #pause-btn.paused { background: rgba(255,255,255,0.08) !important; color: rgba(255,255,255,0.5) !important; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
   .section-header {
@@ -259,6 +261,7 @@
 <div class="header">
   <h1>🚫 SlopRadar</h1>
   <span class="sub">AI feed filter — v1.3</span>
+  <button id="pause-btn" style="margin-left:auto;font-size:0.7rem;font-weight:800;padding:4px 12px;border-radius:5px;border:1px solid rgba(255,255,255,0.3);background:rgba(255,255,255,0.12);color:#fff;cursor:pointer;letter-spacing:0.05rem;transition:background 0.15s">⏸ PAUSE</button>
 </div>
 
 <div class="tabs">
@@ -339,6 +342,16 @@
 
   <div class="setting-group">
     <div class="setting-group-title">Detection</div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Universal mode</div>
+        <div class="setting-desc">Scan any webpage for slop, not just LinkedIn and X (on by default)</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-universal-mode"/>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
     <div class="setting-row">
       <div>
         <div class="setting-label">Minimum confidence to block</div>

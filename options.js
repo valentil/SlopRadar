@@ -141,7 +141,8 @@ function loadSettings() {
     document.getElementById("s-dark-mode").checked = !!s.darkMode;
     document.getElementById("s-trash-can").checked = s.showTrashCan !== false;
     document.getElementById("s-msg-author").checked = s.showMessageAuthor !== false;
-    document.getElementById("s-min-conf").value = s.minConfidence ?? 60;
+    document.getElementById("s-universal-mode").checked = s.universalMode !== false;
+  document.getElementById("s-min-conf").value = s.minConfidence ?? 60;
     document.getElementById("s-min-conf-val").textContent = `${s.minConfidence ?? 60}%`;
     applyDark(!!s.darkMode);
   });
@@ -160,6 +161,7 @@ document.getElementById("save-settings-btn").addEventListener("click", () => {
     darkMode: document.getElementById("s-dark-mode").checked,
     showTrashCan: document.getElementById("s-trash-can").checked,
     showMessageAuthor: document.getElementById("s-msg-author").checked,
+    universalMode: document.getElementById("s-universal-mode").checked,
     minConfidence: parseInt(document.getElementById("s-min-conf").value, 10),
   };
   chrome.runtime.sendMessage({ action: "saveSettings", settings }, () => {
@@ -260,6 +262,35 @@ document.getElementById("compact-btn").addEventListener("click", () => {
 function escHtml(str) {
   return str.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
+
+// ── Pause/Resume ──────────────────────────────────────────────────────────
+let paused = false;
+const pauseBtn = document.getElementById("pause-btn");
+
+function applyPauseUI() {
+  if (!pauseBtn) return;
+  if (paused) {
+    pauseBtn.textContent = "▶ RESUME";
+    pauseBtn.classList.add("paused");
+  } else {
+    pauseBtn.textContent = "⏸ PAUSE";
+    pauseBtn.classList.remove("paused");
+  }
+}
+
+chrome.runtime.sendMessage({ action: "getPauseState" }, (res) => {
+  if (chrome.runtime.lastError || !res) return;
+  paused = res.paused;
+  applyPauseUI();
+});
+
+pauseBtn?.addEventListener("click", () => {
+  paused = !paused;
+  chrome.runtime.sendMessage({ action: "setPauseState", paused }, () => {
+    applyPauseUI();
+    toast(paused ? "⏸ SlopRadar paused" : "▶ SlopRadar resumed");
+  });
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────
 loadStats();
