@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "SlopRadar AI Filter",
-  "version": "1.2",
+  "version": "1.3",
   "description": "Uses local Gemini Nano to remove generic AI marketing posts from social feeds.",
   "permissions": [
     "scripting",
     "tabs",
-    "windows"
+    "windows",
+    "storage"
   ],
   "host_permissions": [
     "*://*.linkedin.com/*",
@@ -14,8 +15,10 @@
     "*://*.twitter.com/*"
   ],
   "action": {
-    "default_title": "SlopRadar"
+    "default_title": "SlopRadar",
+    "default_popup": "options.html"
   },
+  "options_page": "options.html",
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -27,9 +30,7 @@
         "*://*.x.com/*",
         "*://*.twitter.com/*"
       ],
-      "js": [
-        "content.js"
-      ],
+      "js": ["content.js"],
       "run_at": "document_idle"
     }
   ]

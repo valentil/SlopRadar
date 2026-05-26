@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SlopRadar Settings</title>
+<style>
+  :root {
+    --bg: #f9fafb;
+    --surface: #ffffff;
+    --surface2: #f3f4f6;
+    --border: #e5e7eb;
+    --text: #111827;
+    --text2: #6b7280;
+    --red: #e02424;
+    --red-dim: #fef2f2;
+    --green: #137333;
+    --green-dim: #f0fdf4;
+    --accent: #e02424;
+    --tag-bg: #fef2f2;
+    --tag-border: #fca5a5;
+    --tag-text: #991b1b;
+    --shadow: 0 1px 4px rgba(0,0,0,0.08);
+    --radius: 8px;
+  }
+  [data-dark] {
+    --bg: #0f0f0f;
+    --surface: #1a1a1a;
+    --surface2: #242424;
+    --border: #2e2e2e;
+    --text: #f1f1f1;
+    --text2: #888;
+    --red-dim: #2a1010;
+    --green-dim: #0d2018;
+    --tag-bg: #2a1010;
+    --tag-border: #7f1d1d;
+    --tag-text: #fca5a5;
+    --shadow: 0 1px 4px rgba(0,0,0,0.4);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    min-width: 480px;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 0 40px;
+  }
+
+  /* Header */
+  .header {
+    background: var(--red);
+    color: #fff;
+    padding: 18px 24px 14px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .header h1 {
+    font-size: 1.15rem;
+    font-weight: 900;
+    letter-spacing: 0.12rem;
+    text-transform: uppercase;
+  }
+  .header .sub { font-size: 0.72rem; opacity: 0.75; letter-spacing: 0.05rem; }
+
+  /* Nav tabs */
+  .tabs {
+    display: flex;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    gap: 0;
+  }
+  .tab-btn {
+    padding: 10px 16px;
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.08rem;
+    text-transform: uppercase;
+    color: var(--text2);
+    background: none;
+    border: none;
+    border-bottom: 3px solid transparent;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .tab-btn.active { color: var(--red); border-bottom-color: var(--red); }
+  .tab-btn:hover:not(.active) { color: var(--text); }
+
+  /* Panels */
+  .panel { display: none; padding: 20px 24px; }
+  .panel.active { display: block; }
+
+  /* Stats grid */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+  }
+  .stat-card .label { font-size: 0.65rem; color: var(--text2); text-transform: uppercase; letter-spacing: 0.1rem; margin-bottom: 6px; }
+  .stat-card .val { font-size: 1.6rem; font-weight: 900; color: var(--text); }
+  .stat-card .val.red { color: var(--red); }
+  .stat-card .val.green { color: var(--green); }
+  .stat-sub { font-size: 0.7rem; color: var(--text2); margin-top: 3px; }
+
+  /* Site table */
+  .site-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .site-table th {
+    text-align: left; font-size: 0.65rem; color: var(--text2);
+    text-transform: uppercase; letter-spacing: 0.08rem;
+    padding: 6px 10px; border-bottom: 1px solid var(--border);
+  }
+  .site-table td {
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+    font-size: 0.78rem;
+  }
+  .site-table tr:last-child td { border-bottom: none; }
+  .pct-bar { display: flex; align-items: center; gap: 8px; }
+  .pct-track {
+    flex: 1; height: 4px; background: var(--border);
+    border-radius: 2px; overflow: hidden;
+  }
+  .pct-fill { height: 100%; background: var(--red); border-radius: 2px; }
+
+  /* Settings rows */
+  .setting-group { margin-bottom: 20px; }
+  .setting-group-title {
+    font-size: 0.65rem; font-weight: 800; letter-spacing: 0.1rem;
+    text-transform: uppercase; color: var(--text2);
+    margin-bottom: 10px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .setting-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 0; border-bottom: 1px solid var(--border);
+    gap: 16px;
+  }
+  .setting-row:last-child { border-bottom: none; }
+  .setting-label { font-weight: 600; font-size: 0.82rem; }
+  .setting-desc { font-size: 0.71rem; color: var(--text2); margin-top: 2px; }
+
+  /* Toggle switch */
+  .toggle { position: relative; width: 36px; height: 20px; flex-shrink: 0; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-track {
+    position: absolute; inset: 0;
+    background: var(--border); border-radius: 20px;
+    cursor: pointer; transition: background 0.2s;
+  }
+  .toggle input:checked + .toggle-track { background: var(--red); }
+  .toggle-track::after {
+    content: ""; position: absolute;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; top: 3px; left: 3px;
+    transition: transform 0.2s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  }
+  .toggle input:checked + .toggle-track::after { transform: translateX(16px); }
+
+  /* Range slider */
+  .range-wrap { display: flex; align-items: center; gap: 10px; }
+  .range-wrap input[type=range] {
+    width: 140px; accent-color: var(--red);
+  }
+  .range-val {
+    font-size: 0.78rem; font-weight: 700;
+    color: var(--red); min-width: 36px; text-align: right;
+  }
+
+  /* Patterns panel */
+  .patterns-toolbar {
+    display: flex; gap: 8px; margin-bottom: 12px; align-items: center;
+  }
+  .btn {
+    font-size: 0.72rem; font-weight: 700; padding: 6px 12px;
+    border-radius: 5px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text);
+    cursor: pointer; letter-spacing: 0.04rem;
+    transition: background 0.15s;
+  }
+  .btn:hover { background: var(--surface2); }
+  .btn.danger { color: var(--red); border-color: var(--tag-border); background: var(--tag-bg); }
+  .btn.danger:hover { background: #fee2e2; }
+  .btn.primary { background: var(--red); color: #fff; border-color: var(--red); }
+  .btn.primary:hover { opacity: 0.88; }
+  .patterns-count { font-size: 0.72rem; color: var(--text2); margin-left: auto; }
+
+  .pattern-list { display: flex; flex-direction: column; gap: 6px; max-height: 420px; overflow-y: auto; }
+  .pattern-tag {
+    display: flex; align-items: flex-start; gap: 8px;
+    background: var(--tag-bg); border: 1px solid var(--tag-border);
+    border-radius: 6px; padding: 7px 10px;
+  }
+  .pattern-tag .ptxt {
+    flex: 1; font-size: 0.75rem; color: var(--tag-text);
+    line-height: 1.45; word-break: break-word;
+  }
+  .pattern-tag .pdel {
+    flex-shrink: 0; background: none; border: none;
+    color: var(--tag-border); cursor: pointer; font-size: 0.9rem;
+    padding: 0 2px; line-height: 1; opacity: 0.6;
+  }
+  .pattern-tag .pdel:hover { opacity: 1; color: var(--red); }
+
+  .add-pattern-row { display: flex; gap: 8px; margin-top: 10px; }
+  .add-pattern-row input {
+    flex: 1; padding: 7px 10px; font-size: 0.78rem;
+    border: 1px solid var(--border); border-radius: 5px;
+    background: var(--surface); color: var(--text);
+    outline: none;
+  }
+  .add-pattern-row input:focus { border-color: var(--red); }
+
+  /* Status toast */
+  .toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: #111; color: #fff; font-size: 0.75rem;
+    padding: 8px 18px; border-radius: 20px; opacity: 0;
+    transition: opacity 0.3s; pointer-events: none; z-index: 9999;
+    font-weight: 600; letter-spacing: 0.05rem;
+  }
+  .toast.show { opacity: 1; }
+
+  /* Queue display */
+  .queue-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 20px; padding: 3px 12px; font-size: 0.72rem;
+    color: var(--text2); font-weight: 600;
+  }
+  .queue-pill .qdot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #9ca3af;
+  }
+  .queue-pill.active .qdot { background: #fbbf24; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  .section-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .section-header h2 { font-size: 0.85rem; font-weight: 800; }
+
+  hr.divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🚫 SlopRadar</h1>
+  <span class="sub">AI feed filter — v1.3</span>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" data-tab="stats">Stats</button>
+  <button class="tab-btn" data-tab="settings">Settings</button>
+  <button class="tab-btn" data-tab="patterns">Patterns</button>
+</div>
+
+<!-- STATS -->
+<div class="panel active" id="panel-stats">
+  <div class="section-header" style="margin-top:16px">
+    <h2>Performance</h2>
+    <span class="queue-pill" id="queue-pill">
+      <span class="qdot"></span>
+      <span id="queue-label">Queue idle</span>
+    </span>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="label">Queue</div>
+      <div class="val" id="st-queue" style="font-size:1.2rem">—</div>
+      <div class="stat-sub">pending</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Checked</div>
+      <div class="val" id="st-total-checked">—</div>
+      <div class="stat-sub">all time</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Blocked</div>
+      <div class="val red" id="st-total-slop">—</div>
+      <div class="stat-sub">slop posts</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Block rate</div>
+      <div class="val" id="st-block-rate">—</div>
+      <div class="stat-sub">of all posts</div>
+    </div>
+  </div>
+
+  <hr class="divider"/>
+  <h2 style="font-size:0.85rem;font-weight:800;margin-bottom:10px">By site</h2>
+  <table class="site-table">
+    <thead>
+      <tr>
+        <th>Site</th>
+        <th>Checked</th>
+        <th>Blocked</th>
+        <th style="width:160px">Block rate</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr id="st-page-row" style="background:var(--surface2)">
+        <td colspan="4" style="color:var(--text2);padding:8px 10px;font-size:0.72rem">Loading page stats…</td>
+      </tr>
+    </tbody>
+    <tbody id="site-tbody">
+      <tr><td colspan="4" style="color:var(--text2);padding:16px 10px">No data yet</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- SETTINGS -->
+<div class="panel" id="panel-settings">
+  <div class="setting-group" style="margin-top:16px">
+    <div class="setting-group-title">Appearance</div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Dark mode</div>
+        <div class="setting-desc">Use dark theme for this settings panel</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-dark-mode"/>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="setting-group">
+    <div class="setting-group-title">Detection</div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Minimum confidence to block</div>
+        <div class="setting-desc">Posts below this certainty threshold will not be hidden</div>
+      </div>
+      <div class="range-wrap">
+        <input type="range" id="s-min-conf" min="40" max="95" step="5"/>
+        <span class="range-val" id="s-min-conf-val">60%</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="setting-group">
+    <div class="setting-group-title">Card controls</div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Show "learn from this" trash can</div>
+        <div class="setting-desc">Adds a 🗑️ button to NOT SLOP dog-ears to teach the model new patterns</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-trash-can"/>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Show "message author" on slop posts</div>
+        <div class="setting-desc">Adds a ✉️ button on blocked LinkedIn posts to send the author a friendly nudge</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-msg-author"/>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+  </div>
+
+  <div style="margin-top:4px">
+    <button class="btn primary" id="save-settings-btn">Save settings</button>
+  </div>
+</div>
+
+<!-- PATTERNS -->
+<div class="panel" id="panel-patterns">
+  <div style="margin-top:16px">
+    <div class="patterns-toolbar">
+      <button class="btn primary" id="compact-btn">⚡ Compact with AI</button>
+      <button class="btn danger" id="reset-btn">↺ Reset to defaults</button>
+      <span class="patterns-count" id="patterns-count"></span>
+    </div>
+    <div class="pattern-list" id="pattern-list"></div>
+    <div class="add-pattern-row">
+      <input type="text" id="new-pattern-input" placeholder="Add a new slop pattern…"/>
+      <button class="btn primary" id="add-pattern-btn">Add</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="options.js"></script>
+</body>
+</html>
