@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>LinkedIn Feed — SlopRadar Test Fixture</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #f4f2ee; margin: 0; padding: 20px; }
+  .feed-container { max-width: 560px; margin: 0 auto; }
+  .feed-shared-update-v2 {
+    background: #fff; border-radius: 8px; margin-bottom: 12px;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.08); padding: 16px;
+  }
+  .actor { display: flex; gap: 8px; margin-bottom: 8px; }
+  .actor-avatar { width: 44px; height: 44px; border-radius: 50%; background: #ccc; }
+  .actor-name { font-weight: 600; font-size: 14px; }
+  .actor-sub { font-size: 12px; color: #666; }
+  .feed-shared-update-v2__description-wrapper { font-size: 14px; line-height: 1.5; margin: 8px 0; }
+  .social-actions { display: flex; gap: 16px; padding-top: 8px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
+  .social-actions span { cursor: pointer; }
+  h1 { max-width: 560px; margin: 0 auto 16px; font-size: 18px; }
+</style>
+</head>
+<body>
+<h1>LinkedIn Feed Fixture (synthetic — no real user data)</h1>
+<main>
+<div class="feed-container scaffold-finite-scroll__content" data-finite-scroll-hotspot>
+
+  <!-- SLOP #1 — engagement bait, contrarian setup -->
+  <div class="feed-shared-update-v2 occludable-update" data-urn="urn:li:activity:1001" data-sr-expect="slop">
+    <div class="update-components-actor actor">
+      <div class="actor-avatar"></div>
+      <div><div class="actor-name">Ayesha K.</div><div class="actor-sub">AI Entrepreneur • 1st</div></div>
+    </div>
+    <div class="feed-shared-update-v2__description-wrapper">
+      <span dir="ltr">Most companies think AI is about the model. It's not. The model is not the product — the harness is.
+      Nobody's talking about this. What surprised me most: the hardest part wasn't the tech.
+      If you can't see it, you can't fix it. Agree?</span>
+    </div>
+    <div class="social-actions"><span>Like</span><span>Comment</span><span>Repost</span></div>
+  </div>
+
+  <!-- AUTHENTIC #1 — real technical content -->
+  <div class="feed-shared-update-v2 occludable-update" data-urn="urn:li:activity:1002" data-sr-expect="authentic">
+    <div class="update-components-actor actor">
+      <div class="actor-avatar"></div>
+      <div><div class="actor-name">Dev Patel</div><div class="actor-sub">Backend Engineer • 2nd</div></div>
+    </div>
+    <div class="feed-shared-update-v2__description-wrapper">
+      <span dir="ltr">Spent the afternoon tracking down a memory leak in our Node service. Turned out the
+      Express middleware was holding references to request objects in a closure inside a setInterval.
+      Heap went from 180MB to 45MB after I moved the cache outside the handler. Code:
+      `clearInterval(timer)` on 'close' fixed it.</span>
+    </div>
+    <div class="social-actions"><span>Like</span><span>Comment</span><span>Repost</span></div>
+  </div>
+
+  <!-- SLOP #2 — news laundering -->
+  <div class="feed-shared-update-v2 occludable-update" data-urn="urn:li:activity:1003" data-sr-expect="slop">
+    <div class="update-components-actor actor">
+      <div class="actor-avatar"></div>
+      <div><div class="actor-name">Growth Guru</div><div class="actor-sub">Founder • 3rd+</div></div>
+    </div>
+    <div class="feed-shared-update-v2__description-wrapper">
+      <span dir="ltr">Elon just dropped this bombshell. This is massive. A 7-figure founder told me yesterday
+      that AI will bury every agency in a year. I asked him one question, and the silence said everything.
+      AI is changing everything.</span>
+    </div>
+    <div class="social-actions"><span>Like</span><span>Comment</span><span>Repost</span></div>
+  </div>
+
+  <!-- AUTHENTIC #2 — genuine question -->
+  <div class="feed-shared-update-v2 occludable-update" data-urn="urn:li:activity:1004" data-sr-expect="authentic">
+    <div class="update-components-actor actor">
+      <div class="actor-avatar"></div>
+      <div><div class="actor-name">Sara Lin</div><div class="actor-sub">Data Scientist • 1st</div></div>
+    </div>
+    <div class="feed-shared-update-v2__description-wrapper">
+      <span dir="ltr">Has anyone benchmarked DuckDB against ClickHouse for sub-second aggregations on a
+      ~50GB parquet dataset? Specifically curious about cold-start query latency on a 16-core box.
+      Considering both for an internal analytics tool.</span>
+    </div>
+    <div class="social-actions"><span>Like</span><span>Comment</span><span>Repost</span></div>
+  </div>
+
+  <!-- A composer box that must be IGNORED -->
+  <div class="share-box artdeco-modal" role="dialog" data-sr-expect="ignore">
+    <div contenteditable="true" class="mentions-texteditor">
+      Most companies think this draft box should be processed. It must not be.
+    </div>
+  </div>
+
+</div>
+</main>
+</body>
+</html>

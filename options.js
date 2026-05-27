@@ -140,8 +140,8 @@ function loadSettings() {
     currentSettings = s;
     document.getElementById("s-dark-mode").checked = !!s.darkMode;
     document.getElementById("s-trash-can").checked = s.showTrashCan !== false;
-    document.getElementById("s-msg-author").checked = s.showMessageAuthor !== false;
-    document.getElementById("s-universal-mode").checked = s.universalMode !== false;
+      document.getElementById("s-universal-mode").checked = s.universalMode !== false;
+  document.getElementById("s-hide-slop").checked = !!s.hideSlop;
   document.getElementById("s-min-conf").value = s.minConfidence ?? 60;
     document.getElementById("s-min-conf-val").textContent = `${s.minConfidence ?? 60}%`;
     applyDark(!!s.darkMode);
@@ -160,8 +160,8 @@ document.getElementById("save-settings-btn").addEventListener("click", () => {
   const settings = {
     darkMode: document.getElementById("s-dark-mode").checked,
     showTrashCan: document.getElementById("s-trash-can").checked,
-    showMessageAuthor: document.getElementById("s-msg-author").checked,
     universalMode: document.getElementById("s-universal-mode").checked,
+    hideSlop: document.getElementById("s-hide-slop").checked,
     minConfidence: parseInt(document.getElementById("s-min-conf").value, 10),
   };
   chrome.runtime.sendMessage({ action: "saveSettings", settings }, () => {
@@ -297,3 +297,57 @@ loadStats();
 loadSettings();
 loadPatterns();
 setInterval(loadStats, 3000); // refresh stats + page stats every 3s
+
+// ── Site pause controls ───────────────────────────────────────────────────
+function loadPausedSites() {
+  chrome.storage.local.get(["pausedSites"], (data) => {
+    const sites = data.pausedSites || {};
+    const list = document.getElementById("s-paused-sites-list");
+    const entries = Object.keys(sites);
+    if (!list) return;
+    if (entries.length === 0) { list.innerHTML = ''; return; }
+    list.innerHTML = entries.map(host =>
+      `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:0.75rem">
+        <span style="flex:1;color:var(--text2)">${host}</span>
+        <button class="btn" data-host="${host}" style="font-size:0.65rem;padding:2px 8px">Remove</button>
+      </div>`
+    ).join("");
+    list.querySelectorAll("[data-host]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        chrome.runtime.sendMessage({ action: "clearSitePause", hostname: btn.dataset.host }, () => {
+          loadPausedSites();
+          toast(`✓ Unpaused ${btn.dataset.host}`);
+        });
+      });
+    });
+  });
+}
+
+// Get current tab hostname for pause buttons
+chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+  const url = tabs[0]?.url || "";
+  try {
+    const host = new URL(url).hostname;
+    const lbl = document.getElementById("s-site-pause-label");
+    const desc = document.getElementById("s-site-pause-desc");
+    if (lbl) lbl.textContent = `Pause on ${host || "current site"}`;
+    if (desc) desc.textContent = host ? `Stop SlopRadar on ${host}` : "Navigate to a site first";
+
+    document.getElementById("s-pause-session-btn")?.addEventListener("click", () => {
+      if (!host) return;
+      chrome.tabs.sendMessage(tabs[0].id, { action: "pauseSiteSession" }).catch(() => {});
+      toast(`⏸ Paused on ${host} for this visit`);
+    });
+
+    document.getElementById("s-pause-forever-btn")?.addEventListener("click", () => {
+      if (!host) return;
+      chrome.runtime.sendMessage({ action: "setSitePause", hostname: host, forever: true }, () => {
+        chrome.tabs.sendMessage(tabs[0].id, { action: "pauseSiteSession" }).catch(() => {});
+        loadPausedSites();
+        toast(`🚫 Paused forever on ${host}`);
+      });
+    });
+  } catch (_) {}
+});
+
+loadPausedSites();

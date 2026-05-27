@@ -22,3 +22,6 @@ When a post triggers the filter, the extension applies a heavy blur to the offen
 * Click Load unpacked and select the `ChromeSloppExtension` directory
 * Ensure your browser has the experimental Gemini Prompt API enabled for local inference
 
+## Optional Testing
+* npm install      # Installs jsdom dependency
+* npm test         # Runs 40 tests, builds HTML report, opens localhost:8731 to show a report of testing

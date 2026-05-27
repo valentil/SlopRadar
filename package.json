@@ -1,0 +1,13 @@
+{
+  "name": "slopradar-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local test suite for the SlopRadar extension",
+  "scripts": {
+    "test": "node test.js",
+    "test:ci": "node run-tests.js"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.3"
+  }
+}

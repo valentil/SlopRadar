@@ -54,9 +54,9 @@ const MAX_PATTERN_TOKENS = 3000; // rough char budget before we compact
 const DEFAULT_SETTINGS = {
   darkMode: false,
   showTrashCan: true,
-  showMessageAuthor: true,
   minConfidence: 60,
-  universalMode: true, // scan any page, not just LinkedIn/X
+  universalMode: true,
+  hideSlop: false, // hide slop cards entirely instead of blur/collapse
 };
 
 // ── Storage helpers ───────────────────────────────────────────────────────
@@ -198,6 +198,64 @@ Output ONLY a JSON array of new pattern strings. Empty array if none. No markdow
     console.error("[SlopRadar] Learn failed:", err);
     return [];
   }
+}
+
+// ── Unlearn: remove patterns that match a NOT-slop post ─────────────────
+async function unlearnFromPost(postText) {
+  if (!aiSession) return [];
+  try {
+    const existing = await getPatterns();
+    const prompt = `A social media post was incorrectly flagged as slop. Identify which patterns from the list below INCORRECTLY match this post and should be removed or narrowed. Return a JSON object: { "remove": [indices to remove, 0-based], "narrowed": ["replacement text for any patterns that should be more specific rather than removed"] }. If the post is genuinely not slop and certain patterns are too broad, list them.
+
+Patterns:
+${existing.map((p, i) => `${i}. ${p}`).join("\n")}
+
+Post (flagged incorrectly as slop):
+"""
+${postText.substring(0, 800)}
+"""
+
+Output ONLY valid JSON like {"remove":[2,7],"narrowed":[]}. No markdown.`;
+
+    const result = await aiSession.prompt(prompt);
+    const parsed = JSON.parse(result.replace(/```json|```/g, "").trim());
+    const toRemove = new Set(parsed.remove || []);
+    let updated = existing.filter((_, i) => !toRemove.has(i));
+    if (parsed.narrowed?.length) updated = updated.concat(parsed.narrowed);
+    if (updated.length > 5 && updated.length !== existing.length) {
+      await savePatterns(updated);
+      console.log(`[SlopRadar] Unlearned: removed ${toRemove.size}, narrowed ${parsed.narrowed?.length || 0}`);
+      return { removed: toRemove.size, narrowed: parsed.narrowed?.length || 0 };
+    }
+    return { removed: 0, narrowed: 0 };
+  } catch (err) {
+    console.error("[SlopRadar] Unlearn failed:", err);
+    return { removed: 0, narrowed: 0 };
+  }
+}
+
+// ── Site pause (per-hostname) ─────────────────────────────────────────────
+async function getSitePause(hostname) {
+  const d = await storageGet(["pausedSites"]);
+  const sites = d.pausedSites || {};
+  return !!sites[hostname];
+}
+
+async function setSitePause(hostname, forever) {
+  if (forever) {
+    const d = await storageGet(["pausedSites"]);
+    const sites = d.pausedSites || {};
+    sites[hostname] = true;
+    await storageSet({ pausedSites: sites });
+  }
+  // Session pause is handled purely in content script memory
+}
+
+async function clearSitePause(hostname) {
+  const d = await storageGet(["pausedSites"]);
+  const sites = d.pausedSites || {};
+  delete sites[hostname];
+  await storageSet({ pausedSites: sites });
 }
 
 // ── Tab state ─────────────────────────────────────────────────────────────
@@ -349,7 +407,6 @@ AUTHENTIC — classify as 0 ONLY if:
 - Makes a narrow, falsifiable claim with evidence
 - Is a genuine question with no performance attached
 - Contains domain-specific jargon used correctly and precisely (not for show)
-- Looks like a news article e.g. US Stocks extend gains, BREAKING, International geopolitics or market related
 
 Input Text:
 """
@@ -469,6 +526,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === "setPauseState") {
     setPauseState(request.paused).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (request.action === "unlearn") {
+    unlearnFromPost(request.postText).then(res => sendResponse({ ok: true, ...res }));
+    return true;
+  }
+
+  if (request.action === "getSitePause") {
+    getSitePause(request.hostname).then(paused => sendResponse({ paused }));
+    return true;
+  }
+
+  if (request.action === "setSitePause") {
+    setSitePause(request.hostname, request.forever).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  if (request.action === "clearSitePause") {
+    clearSitePause(request.hostname).then(() => sendResponse({ ok: true }));
     return true;
   }
 

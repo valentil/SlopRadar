@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>X Feed — SlopRadar Test Fixture</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #000; color: #e7e9ea; margin: 0; padding: 20px; }
+  .feed { max-width: 600px; margin: 0 auto; }
+  article {
+    border-bottom: 1px solid #2f3336; padding: 12px 16px;
+    background: #000;
+  }
+  .tw-head { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+  .tw-avatar { width: 40px; height: 40px; border-radius: 50%; background: #333; }
+  .tw-name { font-weight: 700; font-size: 15px; }
+  .tw-handle { color: #71767b; font-size: 14px; }
+  time { color: #71767b; font-size: 14px; }
+  [data-testid="tweetText"] { font-size: 15px; line-height: 1.4; margin: 4px 0 8px 48px; }
+  .tw-actions { display: flex; gap: 60px; margin-left: 48px; color: #71767b; font-size: 13px; }
+  h1 { max-width: 600px; margin: 0 auto 16px; font-size: 18px; }
+</style>
+</head>
+<body>
+<h1>X Feed Fixture (synthetic — no real user data)</h1>
+<div class="feed">
+
+  <!-- SLOP #1 — all-caps hype headline -->
+  <article data-testid="tweet" data-sr-expect="slop">
+    <div class="tw-head">
+      <div class="tw-avatar"></div>
+      <span class="tw-name">First Squawk</span>
+      <span class="tw-handle">@FirstSquawk</span>
+      <span>·</span>
+      <time datetime="2024-01-01">11m</time>
+    </div>
+    <div data-testid="tweetText">AI IS REPLACING JOBS FASTER THAN GRADUATES CAN RETRAIN, AND NOBODY IS TALKING ABOUT WHAT THIS REALLY MEANS FOR THE ECONOMY</div>
+    <div class="tw-actions"><span>4</span><span>12</span><span>40</span></div>
+  </article>
+
+  <!-- AUTHENTIC #1 — specific factual report -->
+  <article data-testid="tweet" data-sr-expect="authentic">
+    <div class="tw-head">
+      <div class="tw-avatar"></div>
+      <span class="tw-name">Ya Boy Big Nel</span>
+      <span class="tw-handle">@TheeNelDog</span>
+      <span>·</span>
+      <time datetime="2024-01-01">23h</time>
+    </div>
+    <div data-testid="tweetText">South Korea's central bank auctioned 91-day MSBs at a yield of 2.610%. Bid-to-cover came in at 2.3x, slightly above last month's 2.1x.</div>
+    <div class="tw-actions"><span>4</span><span>2</span><span>4</span></div>
+  </article>
+
+  <!-- SLOP #2 — narrative engagement bait -->
+  <article data-testid="tweet" data-sr-expect="slop">
+    <div class="tw-head">
+      <div class="tw-avatar"></div>
+      <span class="tw-name">Mindset Coach</span>
+      <span class="tw-handle">@coachmindset</span>
+      <span>·</span>
+      <time datetime="2024-01-01">2h</time>
+    </div>
+    <div data-testid="tweetText">Typing code is no longer the moat. Not the syntax. Not the speed. The real moat is taste. I keep hearing this from every senior engineer I talk to. What do you think?</div>
+    <div class="tw-actions"><span>10</span><span>30</span><span>200</span></div>
+  </article>
+
+  <!-- AUTHENTIC #2 — genuine personal thought -->
+  <article data-testid="tweet" data-sr-expect="authentic">
+    <div class="tw-head">
+      <div class="tw-avatar"></div>
+      <span class="tw-name">Drew Wilson</span>
+      <span class="tw-handle">@drewwilson</span>
+      <span>·</span>
+      <time datetime="2024-01-01">18m</time>
+    </div>
+    <div data-testid="tweetText">Finally got the WebGL splat viewer rendering at 60fps after switching the radix sort to a web worker. The main thread was choking on 2M splats. Worker pool of 4 did the trick.</div>
+    <div class="tw-actions"><span>1</span><span>3</span><span>22</span></div>
+  </article>
+
+  <!-- Composer — must be IGNORED -->
+  <div role="dialog" data-sr-expect="ignore">
+    <div data-testid="tweetTextarea_0" contenteditable="true">Nobody is talking about this draft. It must not be processed.</div>
+  </div>
+
+</div>
+</body>
+</html>
