@@ -134,6 +134,29 @@ function createChromeMock() {
       setTitle(o) { chrome.action._badge.title = o.title; },
       setIcon() {},
     },
+
+    // ── contextMenus ──
+    contextMenus: {
+      _items: [],
+      _clickListeners: [],
+      create(opts, cb) {
+        chrome.contextMenus._items.push(opts);
+        if (cb) cb();
+        return opts.id;
+      },
+      removeAll(cb) {
+        chrome.contextMenus._items = [];
+        if (cb) cb();
+      },
+      remove(id, cb) {
+        chrome.contextMenus._items =
+          chrome.contextMenus._items.filter(i => i.id !== id);
+        if (cb) cb();
+      },
+      onClicked: {
+        addListener(fn) { chrome.contextMenus._clickListeners.push(fn); },
+      },
+    },
   };
 
   return chrome;

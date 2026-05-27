@@ -5,10 +5,32 @@ const IS_LINKEDIN = location.hostname.includes("linkedin.com");
 const PAGE_HOSTNAME = location.hostname;
 const PLATFORM = IS_TWITTER ? "twitter" : IS_LINKEDIN ? "linkedin" : "universal";
 
+// ── Default-excluded sites ────────────────────────────────────────────────
+// Universal mode scans any page, but these sites have no "slop feed" to
+// filter and scanning them is pure overhead (or actively annoying — e.g.
+// blurring your own chat messages). Matched as hostname substrings.
+const DEFAULT_EXCLUDED_SITES = [
+  "chatgpt.com", "chat.openai.com",
+  "claude.ai",
+  "gemini.google.com", "aistudio.google.com",
+  "mail.google.com", "outlook.com", "outlook.live.com",
+  "gmail.com",
+  "docs.google.com", "drive.google.com", "calendar.google.com",
+  "meet.google.com", "notion.so", "figma.com",
+  "github.com", "gitlab.com", "stackoverflow.com",
+  "localhost", "127.0.0.1",
+];
+
+function isExcludedSite(hostname, extraList) {
+  const all = DEFAULT_EXCLUDED_SITES.concat(extraList || []);
+  return all.some(s => s && hostname.includes(s));
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────
 let settings = {
   darkMode: false, showTrashCan: true,
   minConfidence: 60, universalMode: true, hideSlop: false,
+  excludedSites: [], // user-added extra exclusions
 };
 let isPaused = false;
 
@@ -18,6 +40,25 @@ const sessionPausedSites = new Set();
 
 function isSitePaused() {
   return sessionPausedSites.has(PAGE_HOSTNAME);
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────
+// srLog() both prints to the console AND forwards the line to the background
+// worker, which keeps a ring buffer that the Settings page renders as a live
+// log window. This replaces scattered console.log calls.
+function srLog(...args) {
+  const msg = args.map(a =>
+    typeof a === "string" ? a : JSON.stringify(a)
+  ).join(" ");
+  console.log("[SlopRadar]", msg);
+  try {
+    chrome.runtime.sendMessage({
+      action: "log",
+      line: msg,
+      host: PAGE_HOSTNAME,
+      ts: Date.now(),
+    }).catch(() => {});
+  } catch (_) {}
 }
 
 function loadSettings(cb) {
@@ -56,7 +97,81 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     draining = false;
     showSitePauseBanner();
   }
+  if (request.action === "markRightClickedAsSlop") {
+    markRightClickedAsSlop(request.selectionText || "");
+  }
 });
+
+// ── Right-click target tracking ───────────────────────────────────────────
+// We remember the element under the most recent right-click so the
+// background context-menu click handler can act on it. The contextmenu
+// event fires before the menu opens, so lastRightClicked is always fresh.
+let lastRightClicked = null;
+document.addEventListener("contextmenu", (e) => {
+  lastRightClicked = e.target;
+}, true);
+
+// Resolve the post wrapper from whatever was right-clicked, then teach the
+// model from it and remove it immediately — the "Block this ad" workflow.
+function markRightClickedAsSlop(selectionText) {
+  let wrapper = null;
+
+  // Prefer the post that contains the right-clicked node.
+  if (lastRightClicked && lastRightClicked.nodeType === Node.ELEMENT_NODE) {
+    // Find a text node inside the clicked element to resolve the wrapper.
+    const probe = lastRightClicked.closest?.(
+      'article, [data-urn], [data-id], .feed-shared-update-v2, .occludable-update'
+    );
+    if (probe) {
+      wrapper = probe;
+    } else {
+      // Walk up looking for something getPostWrapper recognises.
+      let el = lastRightClicked;
+      for (let i = 0; i < 12 && el && el.tagName !== "BODY"; i++) {
+        const w = getPostWrapper(el);
+        if (w) { wrapper = w; break; }
+        el = el.parentElement;
+      }
+    }
+  }
+
+  // The post text: prefer the wrapper's text, fall back to any selection.
+  const postText = (
+    (wrapper && wrapper.textContent) ||
+    selectionText ||
+    (lastRightClicked && lastRightClicked.textContent) ||
+    ""
+  ).trim().substring(0, 800);
+
+  if (postText.length < 20) {
+    srLog("right-click teach: couldn't find post text — nothing taught");
+    return;
+  }
+
+  // 1. Remove / mark the element immediately (don't wait for the model).
+  if (wrapper) {
+    resetWrapper(wrapper);
+    applySlop(wrapper, 95); // user said it's slop — high confidence
+    srLog(`right-click: marked post as slop — "${postText.substring(0, 50)}…"`);
+  }
+
+  // 2. Teach the model in the background — modular userTaughtPatterns bucket.
+  chrome.runtime.sendMessage(
+    { action: "teachMissedPost", postText },
+    (res) => {
+      if (chrome.runtime.lastError || !res) {
+        srLog("right-click teach: background did not respond");
+        return;
+      }
+      if (res.ok && res.patterns && res.patterns.length > 0) {
+        srLog(`right-click teach: learned ${res.patterns.length} new pattern(s): ` +
+          res.patterns.join(" | "));
+      } else {
+        srLog(`right-click teach: ${res.note || res.reason || "no new patterns"}`);
+      }
+    }
+  );
+}
 
 // ── Tab ID + lifecycle ────────────────────────────────────────────────────
 let MY_TAB_ID = -1;
@@ -84,10 +199,12 @@ setInterval(() => {
 function flushQueue() {
   pendingNodes.length = 0;
   targetedTextNodes.clear();
-  // evaluatedWrappers is a WeakSet — can't .clear(); it self-empties as
-  // detached nodes are garbage-collected after navigation.
-  postCache.clear && postCache.clear();
-  console.log("[SlopRadar] Queue flushed");
+  // NOTE: we deliberately do NOT clear verdictCache here. It is keyed on
+  // post text, so keeping it across SPA navigation is exactly what lets a
+  // returning page be re-stamped instantly without re-running the AI.
+  // evaluatedWrappers is a WeakSet — it self-empties as detached nodes
+  // are garbage-collected after navigation.
+  srLog("Queue flushed (verdict cache kept)");
 }
 
 // ── Page stats ────────────────────────────────────────────────────────────
@@ -98,14 +215,49 @@ function recordResult(isSlop) {
   chrome.runtime.sendMessage({ action: "recordResult", hostname: PAGE_HOSTNAME, isSlop }).catch(() => {});
 }
 
-// ── Post cache (WeakMap: wrapper → {isSlop, confidence, text}) ────────────
-const postCache = new WeakMap();
+// ── Verdict cache — keyed on POST TEXT, not DOM element ───────────────────
+// X (and LinkedIn) destroy and rebuild feed DOM nodes on back-navigation,
+// so an element-keyed WeakMap forgets everything the moment you navigate.
+// Keying on a hash of the post's text means a verdict survives navigation:
+// when the same post reappears in a brand-new wrapper element, we recognise
+// it instantly and re-stamp it without re-running the AI.
+const verdictCache = new Map(); // textHash → {isSlop, confidence, ts}
+const VERDICT_CACHE_MAX = 600;  // cap memory; oldest entries evicted
+
+function hashPostText(text) {
+  // Normalize: collapse whitespace, lowercase, trim to a stable prefix.
+  const norm = (text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .slice(0, 280);
+  // djb2 — fast, good enough for dedup keys
+  let h = 5381;
+  for (let i = 0; i < norm.length; i++) {
+    h = ((h << 5) + h + norm.charCodeAt(i)) | 0;
+  }
+  return `${h}:${norm.length}`;
+}
+
+function cacheGetVerdict(text) {
+  const v = verdictCache.get(hashPostText(text));
+  return v || null;
+}
+
+function cacheSetVerdict(text, isSlop, confidence) {
+  const key = hashPostText(text);
+  verdictCache.set(key, { isSlop, confidence, ts: Date.now() });
+  // Evict oldest if over cap
+  if (verdictCache.size > VERDICT_CACHE_MAX) {
+    const oldest = verdictCache.keys().next().value;
+    verdictCache.delete(oldest);
+  }
+}
 
 // ── Viewport-priority queue ───────────────────────────────────────────────
 let pendingNodes = [];
 const targetedTextNodes = new Set();
 const evaluatedWrappers = new WeakSet();
-const evaluatedLengths = new WeakMap();
 const nodeTextSnapshot = new WeakMap(); // textNode → last seen text (recycle detection)
 let currentQueueSize = 0;
 
@@ -313,12 +465,15 @@ function getLinkedInWrapper(textNode) {
 
   // Reject anything that isn't in the main feed scroll region — this keeps
   // us out of the nav, the left/right rails, and the messaging overlay.
-  // LinkedIn's feed lives under one of these stable containers.
+  // NOTE: closest() cannot cross a shadow boundary, so if the post is
+  // rendered inside a shadow root the feed-root container (which lives in
+  // the light DOM) is unreachable. In that case we skip the feed-root gate
+  // and rely on the modal/comment rejection plus the wrapper walk instead.
   const feedRoot = textNode.closest(
     '[data-finite-scroll-hotspot], .scaffold-finite-scroll, ' +
     '.scaffold-layout__main, main'
   );
-  if (!feedRoot) return null;
+  if (!feedRoot && !isInShadow(textNode)) return null;
 
   // Reject comment text — comments sit inside .comments-comment-* containers
   // and we only want top-level posts.
@@ -419,11 +574,11 @@ function uncategorizeSlop(wrapper, postText, btn) {
     wrapper.classList.remove("sr_hide_mode");
     wrapper.style.removeProperty("max-height");
     wrapper.style.removeProperty("overflow");
-    // Update cache
-    postCache.set(wrapper, { isSlop: false, confidence: 0 });
+    // Update cache — keyed on the post text so it survives navigation
+    cacheSetVerdict(postText, false, 0);
     evaluatedWrappers.delete(wrapper); // allow re-stamp
     applyNotSlop(wrapper, 0, true);   // force=true skips evaluated check
-    console.log("[SlopRadar] Uncategorized as NOT SLOP");
+    srLog("Uncategorized as NOT SLOP");
   });
 }
 
@@ -449,7 +604,7 @@ function showSitePauseBanner() {
 }
 
 // ── Apply SLOP ────────────────────────────────────────────────────────────
-function applySlop(wrapper, confidence) {
+function applySlop(wrapper, confidence, fromCache = false) {
   if (evaluatedWrappers.has(wrapper)) return;
   if (wrapper.querySelector(".slop_dog_ear")) return;
   wrapper.querySelector(".not_slop_dog_ear")?.remove();
@@ -457,7 +612,7 @@ function applySlop(wrapper, confidence) {
 
   evaluatedWrappers.add(wrapper);
   const postText = wrapper.textContent?.trim().substring(0, 800) || "";
-  postCache.set(wrapper, { isSlop: true, confidence, text: postText });
+  cacheSetVerdict(postText, true, confidence);
 
   wrapper.classList.add("slop_radar_card", `slop_radar_${PLATFORM}`);
   wrapper.setAttribute("data-slop-detected", "true");
@@ -535,17 +690,17 @@ function applySlop(wrapper, confidence) {
     });
   }
 
-  recordResult(true);
+  if (!fromCache) recordResult(true);
 }
 
 // ── Apply NOT SLOP ────────────────────────────────────────────────────────
-function applyNotSlop(wrapper, confidence, force = false) {
+function applyNotSlop(wrapper, confidence, force = false, fromCache = false) {
   if (!force && evaluatedWrappers.has(wrapper)) return;
   if (wrapper.getAttribute("data-slop-detected") === "true") return;
 
   evaluatedWrappers.add(wrapper);
   const postText = wrapper.textContent?.trim().substring(0, 800) || "";
-  postCache.set(wrapper, { isSlop: false, confidence, text: postText });
+  cacheSetVerdict(postText, false, confidence);
   wrapper.dataset.srStampedText = postText.substring(0, 120);
 
   wrapper.classList.add("slop_radar_card", `slop_radar_${PLATFORM}`);
@@ -598,7 +753,7 @@ function applyNotSlop(wrapper, confidence, force = false) {
 
     wrapper.appendChild(ear);
   }
-  recordResult(false);
+  if (!fromCache) recordResult(false);
 }
 
 // ── Text selectors ────────────────────────────────────────────────────────
@@ -624,6 +779,7 @@ function getTextSelectors() {
 
 // ── Drain loop ────────────────────────────────────────────────────────────
 let draining = false;
+let swFailureStreak = 0; // consecutive service-worker failures
 
 async function drainOne() {
   if (isPaused || isSitePaused() || pendingNodes.length === 0) { draining = false; return; }
@@ -637,28 +793,60 @@ async function drainOne() {
     requestAnimationFrame(drainOne); return;
   }
 
-  if (postCache.has(wrapper)) {
-    const cached = postCache.get(wrapper);
-    if (cached.isSlop) applySlop(wrapper, cached.confidence);
-    else applyNotSlop(wrapper, cached.confidence);
-    requestAnimationFrame(drainOne); return;
-  }
-
   const rawText = (textNode.textContent || "").trim();
-  if (rawText.length < 40 || evaluatedLengths.get(wrapper) === rawText.length) {
+  if (rawText.length < 40) {
     requestAnimationFrame(drainOne); return;
   }
-  evaluatedLengths.set(wrapper, rawText.length);
 
-  console.log(`[SlopRadar] Q:${pendingNodes.length} "${rawText.substring(0,60)}…"`);
+  // ── Cache hit — keyed on post text, survives X back-navigation ──────────
+  const cached = cacheGetVerdict(rawText);
+  if (cached) {
+    if (cached.isSlop) applySlop(wrapper, cached.confidence, true);
+    else applyNotSlop(wrapper, cached.confidence, false, true);
+    requestAnimationFrame(drainOne);
+    return;
+  }
+
+  srLog(`Q:${pendingNodes.length} "${rawText.substring(0,60)}…"`);
 
   chrome.runtime.sendMessage(
     { action: "evaluatePost", text: rawText.substring(0, 1500), tabId: MY_TAB_ID },
     (response) => {
-      if (chrome.runtime.lastError) { requestAnimationFrame(drainOne); return; }
-      const confidence = response?.confidence ?? 50;
-      if (response?.isSlop) applySlop(wrapper, confidence);
-      else if (response) applyNotSlop(wrapper, confidence);
+      // ── Service worker failure handling ────────────────────────────────
+      // When X is left open a long time the MV3 service worker goes idle
+      // and may drop messages, producing chrome.runtime.lastError or an
+      // undefined response. The old code stamped these as confidence 50,
+      // which is the "everything is 50%" bug. Instead: do NOT stamp, do
+      // NOT cache — re-queue the post so it retries once the worker wakes.
+      const failed = chrome.runtime.lastError ||
+                     !response ||
+                     typeof response.isSlop === "undefined";
+
+      if (failed) {
+        swFailureStreak++;
+        // Re-queue this node at the back so it retries later.
+        if (document.contains(wrapper) && !evaluatedWrappers.has(wrapper)) {
+          targetedTextNodes.delete(textNode); // allow re-enqueue
+          pendingNodes.push({ textNode, wrapper });
+        }
+        if (swFailureStreak === 1 || swFailureStreak % 10 === 0) {
+          srLog(
+            `⚠ service worker not responding ` +
+            `(streak ${swFailureStreak}) — re-queued post, will retry. ` +
+            (chrome.runtime.lastError?.message || "empty response")
+          );
+        }
+        // Back off a little so we don't hammer a dead worker.
+        setTimeout(() => requestAnimationFrame(drainOne),
+          Math.min(2000, 150 * swFailureStreak));
+        return;
+      }
+
+      // Healthy response — reset the streak.
+      swFailureStreak = 0;
+      const confidence = response.confidence ?? 50;
+      if (response.isSlop) applySlop(wrapper, confidence);
+      else applyNotSlop(wrapper, confidence);
       requestAnimationFrame(drainOne);
     }
   );
@@ -708,7 +896,9 @@ function enqueueNode(textNode) {
 // Remove all SlopRadar marks from a recycled wrapper so it can be re-evaluated
 function resetWrapper(wrapper) {
   evaluatedWrappers.delete(wrapper);
-  postCache.delete(wrapper);
+  // NOTE: verdictCache is text-keyed, not element-keyed, so there is
+  // nothing to delete here — a recycled wrapper holding the same text
+  // will simply hit the cache again, which is what we want.
   wrapper.removeAttribute("data-slop-detected");
   wrapper.removeAttribute("data-sr-revealed");
   delete wrapper.dataset.srStampedText;
@@ -757,44 +947,150 @@ const SWEEP_INTERVAL_MS = IS_LINKEDIN ? 1200 : 700; // gentler cadence on Linked
 // Set to true to get verbose per-sweep diagnostics in the console.
 const SR_DEBUG = true;
 
-// Probe a range of candidate selectors and report which ones match.
-// Runs only in debug mode, only on the first few sweeps. This tells us
-// definitively what LinkedIn's current DOM looks like.
+// Deep diagnostic — runs whenever a sweep matches nothing. Tells us
+// definitively whether the DOM is empty, in an iframe, in shadow DOM,
+// or just using class names we don't know.
 function probeSelectors() {
   const candidates = [
-    'span[dir="ltr"]',
-    'div[dir="ltr"]',
-    '[dir="ltr"]',
-    '.update-components-text',
-    '.feed-shared-update-v2__description-wrapper',
-    '.feed-shared-inline-show-more-text',
-    '.feed-shared-text',
+    'span[dir="ltr"]', 'div[dir="ltr"]', '[dir="ltr"]',
+    '.update-components-text', '.feed-shared-update-v2__description-wrapper',
+    '.feed-shared-inline-show-more-text', '.feed-shared-text',
     '.update-components-update-v2__commentary',
-    'article',
-    '[data-urn]',
-    '[data-id]',
-    '.feed-shared-update-v2',
-    '.fie-impression-container',
-    'main',
-    '.scaffold-finite-scroll__content',
-    '[data-finite-scroll-hotspot]',
+    'article', '[data-urn]', '[data-id]', '[data-activity-urn]',
+    '.feed-shared-update-v2', '.fie-impression-container',
+    'main', '.scaffold-finite-scroll__content', '[data-finite-scroll-hotspot]',
+    '.scaffold-layout__main', '[role="main"]',
   ];
-  const hits = candidates
-    .map(sel => {
-      let n = 0;
-      try { n = document.querySelectorAll(sel).length; } catch (_) {}
-      return `${sel}=${n}`;
-    })
-    .filter(s => !s.endsWith("=0"));
-  console.log("[SlopRadar] selector probe →", hits.length ? hits.join("  ") : "NOTHING matched anything");
+
+  // Flat (document only) vs deep (shadow + iframes) counts side by side.
+  const hits = candidates.map(sel => {
+    let flat = 0, deep = 0;
+    try { flat = document.querySelectorAll(sel).length; } catch (_) {}
+    try { deep = deepQuery(sel, document).length; } catch (_) {}
+    return { sel, flat, deep };
+  }).filter(h => h.flat > 0 || h.deep > 0);
+
+  console.log("[SlopRadar] ── DIAGNOSTIC ──────────────────────────────");
+  console.log("[SlopRadar] total elements in document:", document.querySelectorAll("*").length);
+  console.log("[SlopRadar] body text length:", (document.body?.innerText || "").length);
+  console.log("[SlopRadar] selector hits (flat → deep):",
+    hits.length
+      ? hits.map(h => `${h.sel}=${h.flat}→${h.deep}`).join("  ")
+      : "NONE — every candidate matched 0 even deep");
+
+  const iframes = document.querySelectorAll("iframe");
+  console.log("[SlopRadar] iframes on page:", iframes.length);
+  // How many iframes are same-origin (reachable)?
+  let sameOrigin = 0;
+  iframes.forEach(f => { try { if (f.contentDocument) sameOrigin++; } catch (_) {} });
+  console.log("[SlopRadar] same-origin (reachable) iframes:", sameOrigin);
+
+  let shadowHosts = 0;
+  document.querySelectorAll("*").forEach(el => { if (el.shadowRoot) shadowHosts++; });
+  console.log("[SlopRadar] elements with open shadowRoot:", shadowHosts);
+
+  // Largest text block — search DEEP this time so we find the real post text
+  let biggest = null, biggestLen = 0;
+  deepQuery("span,div,p", document).forEach(el => {
+    const t = (el.textContent || "").trim();
+    if (t.length > biggestLen && t.length < 2200) { biggestLen = t.length; biggest = el; }
+  });
+  if (biggest) {
+    console.log("[SlopRadar] largest text block:", biggestLen, "chars |",
+      "tag:", biggest.tagName,
+      "| class:", (biggest.className || "(none)").toString().slice(0, 80),
+      "| dir:", biggest.getAttribute("dir") || "(none)",
+      "| in-shadow:", isInShadow(biggest));
+  }
+  console.log("[SlopRadar] location.href:", location.href);
+  console.log("[SlopRadar] ────────────────────────────────────────────");
+}
+
+// Is an element inside a shadow root (rather than the main document)?
+function isInShadow(el) {
+  let node = el;
+  while (node) {
+    const root = node.getRootNode && node.getRootNode();
+    if (root && root.host) return true; // ShadowRoot has a .host
+    node = root && root.host ? root.host : null;
+  }
+  return false;
 }
 
 let sweepCount = 0;
+let lastProbeAt = 0;
+
+// ── Deep DOM query — pierces shadow roots and same-origin iframes ─────────
+// LinkedIn now renders feed posts inside shadow DOM and/or iframes.
+// document.querySelectorAll cannot cross those boundaries, so a normal
+// query returns almost nothing. deepQuery walks every open shadowRoot and
+// every reachable same-origin iframe document and collects matches from all
+// of them.
+function deepQuery(selector, root, out, seenDocs, depth) {
+  out = out || [];
+  seenDocs = seenDocs || new Set();
+  depth = depth || 0;
+  if (depth > 12 || !root) return out;
+
+  // Matches in this root
+  try {
+    root.querySelectorAll(selector).forEach(el => out.push(el));
+  } catch (_) { /* invalid selector for this root — ignore */ }
+
+  // Descend into shadow roots
+  try {
+    root.querySelectorAll("*").forEach(el => {
+      if (el.shadowRoot) {
+        deepQuery(selector, el.shadowRoot, out, seenDocs, depth + 1);
+      }
+    });
+  } catch (_) {}
+
+  // Descend into same-origin iframes
+  try {
+    const frames = root.querySelectorAll("iframe");
+    frames.forEach(frame => {
+      let doc = null;
+      try { doc = frame.contentDocument; } catch (_) { doc = null; } // cross-origin → null
+      if (doc && !seenDocs.has(doc)) {
+        seenDocs.add(doc);
+        deepQuery(selector, doc, out, seenDocs, depth + 1);
+      }
+    });
+  } catch (_) {}
+
+  return out;
+}
+
+// Count how many shadow roots / iframes exist — used to decide whether the
+// deep path is even needed (it's more expensive than a flat query).
+let pageUsesShadowOrFrames = false;
+function detectShadowOrFrames() {
+  try {
+    if (document.querySelectorAll("iframe").length > 0) { pageUsesShadowOrFrames = true; return; }
+    const els = document.querySelectorAll("*");
+    for (let i = 0; i < els.length; i++) {
+      if (els[i].shadowRoot) { pageUsesShadowOrFrames = true; return; }
+    }
+  } catch (_) {}
+}
+
 function sweep() {
   if (isPaused || isSitePaused()) return;
   sweepCount++;
 
-  const rawMatches = document.querySelectorAll(getTextSelectors());
+  // Flat query first (cheap). If it finds nothing AND the page has shadow
+  // roots or iframes, fall back to the deep query.
+  let rawMatches = Array.from(document.querySelectorAll(getTextSelectors()));
+  let usedDeep = false;
+  if (rawMatches.length === 0) {
+    detectShadowOrFrames();
+    if (pageUsesShadowOrFrames) {
+      rawMatches = deepQuery(getTextSelectors(), document);
+      usedDeep = true;
+    }
+  }
+
   let found = 0;
   let rejectedComposer = 0, rejectedShort = 0, rejectedNoWrapper = 0, rejectedDup = 0;
 
@@ -810,18 +1106,16 @@ function sweep() {
     else rejectedDup++;
   });
 
-  // Log the first several sweeps + any sweep that finds something.
-  if (SR_DEBUG && (sweepCount <= 6 || found > 0)) {
-    console.log(
-      `[SlopRadar] sweep #${sweepCount} on ${PLATFORM}: ` +
-      `selector matched ${rawMatches.length} | enqueued ${found} | ` +
-      `queue ${pendingNodes.length} ` +
-      `(rejected: composer ${rejectedComposer}, short ${rejectedShort}, ` +
-      `no-wrapper ${rejectedNoWrapper}, dup/seen ${rejectedDup})`
+  if (SR_DEBUG) {
+    srLog(
+      `sweep #${sweepCount} (${PLATFORM}): ` +
+      `matched ${rawMatches.length}${usedDeep ? " [deep]" : ""} | ` +
+      `enqueued ${found} | queue ${pendingNodes.length} ` +
+      `(rej: composer ${rejectedComposer}, short ${rejectedShort}, ` +
+      `noWrap ${rejectedNoWrapper}, dup ${rejectedDup})`
     );
-    // On sweep #2, if nothing matched, dump a full selector probe so we
-    // can see exactly what LinkedIn's DOM exposes right now.
-    if (rawMatches.length === 0 && sweepCount === 2) {
+    if (rawMatches.length === 0 && Date.now() - lastProbeAt > 5000) {
+      lastProbeAt = Date.now();
       probeSelectors();
     }
   }
@@ -847,7 +1141,7 @@ function safeSweep() {
   try {
     sweep();
   } catch (err) {
-    console.warn("[SlopRadar] sweep error (non-fatal, will retry):", err);
+    srLog("sweep error (non-fatal, will retry):", String(err));
   }
 }
 
@@ -868,6 +1162,14 @@ window.addEventListener("scroll", () => {
 // ── Bootstrap ─────────────────────────────────────────────────────────────
 loadSettings(() => {
   applyTheme(IS_TWITTER ? "dark" : (settings.darkMode ? "dark" : "light"));
+
+  // Skip default-excluded sites (ChatGPT, Claude, Gmail, etc.) entirely.
+  // X and LinkedIn always run — they are the whole point of the extension.
+  if (!IS_TWITTER && !IS_LINKEDIN &&
+      isExcludedSite(PAGE_HOSTNAME, settings.excludedSites)) {
+    srLog(`${PAGE_HOSTNAME} is on the excluded list — not scanning.`);
+    return;
+  }
 
   if (isSitePaused()) {
     showSitePauseBanner();

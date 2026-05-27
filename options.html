@@ -268,6 +268,7 @@
   <button class="tab-btn active" data-tab="stats">Stats</button>
   <button class="tab-btn" data-tab="settings">Settings</button>
   <button class="tab-btn" data-tab="patterns">Patterns</button>
+  <button class="tab-btn" data-tab="logs">Logs</button>
   <button class="tab-btn" data-tab="about">About</button>
 </div>
 
@@ -404,6 +405,22 @@
     <div id="s-paused-sites-list" style="margin-top:8px"></div>
   </div>
 
+  <div class="setting-group">
+    <div class="setting-group-title">Excluded sites</div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Never scan these sites</div>
+        <div class="setting-desc">In universal mode, skip these hostnames entirely. ChatGPT, Claude, Gmail, Gemini and other common non-feed sites are already skipped by default.</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:4px">
+      <input type="text" id="s-exclude-input" placeholder="example.com"
+        style="flex:1;font-size:0.75rem;padding:5px 8px;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text)"/>
+      <button class="btn" id="s-exclude-add-btn" style="flex-shrink:0">Add</button>
+    </div>
+    <div id="s-excluded-list" style="margin-top:8px"></div>
+  </div>
+
   <div style="margin-top:4px">
     <button class="btn primary" id="save-settings-btn">Save settings</button>
   </div>
@@ -421,6 +438,46 @@
     <div class="add-pattern-row">
       <input type="text" id="new-pattern-input" placeholder="Add a new slop pattern…"/>
       <button class="btn primary" id="add-pattern-btn">Add</button>
+    </div>
+
+    <div style="margin-top:22px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <div class="setting-group-title" style="margin:0">Right-click taught patterns</div>
+        <span class="patterns-count" id="user-patterns-count" style="margin-left:0"></span>
+        <button class="btn danger" id="user-clear-btn"
+          style="margin-left:auto;font-size:0.65rem;padding:3px 9px">Clear all</button>
+      </div>
+      <div style="font-size:0.68rem;color:var(--text2);margin-bottom:8px">
+        Patterns the local model extracted when you right-clicked a missed post and chose
+        “mark this as slop”. Kept separate from the core list so they stay modular and don’t
+        get merged away.
+      </div>
+      <div class="pattern-list" id="user-pattern-list" style="max-height:240px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- LOGS -->
+<div class="panel" id="panel-logs">
+  <div style="margin-top:16px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:0.75rem;font-weight:600">
+        <input type="checkbox" id="log-autoscroll" checked/> Auto-scroll
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:0.75rem;font-weight:600">
+        <input type="checkbox" id="log-pause"/> Pause updates
+      </label>
+      <span id="log-count" style="font-size:0.7rem;color:var(--text2)"></span>
+      <button class="btn danger" id="log-clear-btn" style="margin-left:auto;font-size:0.7rem;padding:3px 10px">Clear</button>
+    </div>
+    <div id="log-window" style="
+      background:#0d1117;color:#c9d1d9;border:1px solid var(--border);
+      border-radius:8px;padding:10px;height:340px;overflow-y:auto;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+      font-size:0.68rem;line-height:1.55;white-space:pre-wrap;word-break:break-word">
+    </div>
+    <div style="font-size:0.66rem;color:var(--text2);margin-top:6px">
+      Live scraper activity from the content script — sweeps, queue drains, and errors.
     </div>
   </div>
 </div>

@@ -57,6 +57,7 @@ const DEFAULT_SETTINGS = {
   minConfidence: 60,
   universalMode: true,
   hideSlop: false, // hide slop cards entirely instead of blur/collapse
+  excludedSites: [], // extra user-added hostnames to skip in universal mode
 };
 
 // ── Storage helpers ───────────────────────────────────────────────────────
@@ -111,6 +112,27 @@ async function savePatterns(patterns) {
   await storageSet({ slopPatterns: patterns });
 }
 
+// ── User-taught patterns (modular) ────────────────────────────────────────
+// Patterns the user explicitly taught via right-click "mark as slop" are
+// kept in their OWN bucket, separate from the core slopPatterns list. This
+// keeps them modular: they are never merged into the main list by the
+// compactor, and the prompt presents them as a distinct, recent signal so
+// a freshly-taught pattern doesn't dilute or override the established ones.
+// Each entry: { text, source, ts } — source is a short snippet of the post
+// it was taught from, for display + dedup.
+const MAX_USER_PATTERNS = 60;
+
+async function getUserPatterns() {
+  const data = await storageGet(["userTaughtPatterns"]);
+  return Array.isArray(data.userTaughtPatterns) ? data.userTaughtPatterns : [];
+}
+
+async function saveUserPatterns(list) {
+  // Keep newest, cap the list.
+  const capped = list.slice(-MAX_USER_PATTERNS);
+  await storageSet({ userTaughtPatterns: capped });
+}
+
 async function getSettings() {
   const data = await storageGet(["settings"]);
   return { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
@@ -137,6 +159,59 @@ async function initEngine() {
 
 chrome.runtime.onInstalled.addListener(initEngine);
 chrome.runtime.onStartup.addListener(initEngine);
+
+// ── Teach from a missed post (right-click "mark as slop") ────────────────
+// Modular by design: the model extracts patterns FROM THIS SPECIFIC POST
+// only, and they land in the separate userTaughtPatterns bucket. We pass
+// the existing patterns purely so the model avoids duplicating them — the
+// new ones never get merged into the core list.
+async function teachFromMissedPost(postText) {
+  if (!aiSession) return { ok: false, reason: "AI engine not ready", patterns: [] };
+  try {
+    const corePatterns = await getPatterns();
+    const userPatterns = await getUserPatterns();
+    const alreadyKnown = corePatterns.concat(userPatterns.map(u => u.text));
+
+    const prompt = `A user manually flagged the social media post below as AI slop that the filter MISSED. Identify 1-2 specific, generalizable anti-patterns this post demonstrates — focus on what makes THIS post slop. Do not repeat anything already in the known list. Keep each pattern a short phrase (under 12 words), specific enough to catch similar posts but not so broad it would catch genuine content.
+
+Known patterns (do NOT repeat):
+${alreadyKnown.map((p, i) => `${i + 1}. ${p}`).join("\n")}
+
+The missed slop post:
+"""
+${postText.substring(0, 800)}
+"""
+
+Output ONLY a JSON array of 1-2 new pattern strings. No markdown, no explanation.`;
+
+    const result = await aiSession.prompt(prompt);
+    const clean = result.replace(/```json|```/g, "").trim();
+    let extracted = [];
+    try { extracted = JSON.parse(clean); } catch (_) { extracted = []; }
+    if (!Array.isArray(extracted)) extracted = [];
+
+    // Filter out empties and anything that duplicates a known pattern.
+    const knownLower = new Set(alreadyKnown.map(p => p.toLowerCase().trim()));
+    const fresh = extracted
+      .map(p => String(p).trim())
+      .filter(p => p.length > 3 && !knownLower.has(p.toLowerCase()));
+
+    if (fresh.length === 0) {
+      return { ok: true, patterns: [], note: "No new patterns — already covered." };
+    }
+
+    const snippet = postText.substring(0, 100).replace(/\s+/g, " ").trim();
+    const userPatternsNext = userPatterns.concat(
+      fresh.map(text => ({ text, source: snippet, ts: Date.now() }))
+    );
+    await saveUserPatterns(userPatternsNext);
+    console.log(`[SlopRadar] Taught ${fresh.length} user pattern(s):`, fresh);
+    return { ok: true, patterns: fresh };
+  } catch (err) {
+    console.error("[SlopRadar] teachFromMissedPost failed:", err);
+    return { ok: false, reason: String(err), patterns: [] };
+  }
+}
 
 // ── Compact patterns when too large ──────────────────────────────────────
 async function maybeCompactPatterns() {
@@ -366,9 +441,10 @@ async function drainQueue() {
 
     const settings = await getSettings();
     const patterns = await getPatterns();
+    const userPatterns = await getUserPatterns();
 
     try {
-      const result = await aiSession.prompt(buildPrompt(item.text, patterns));
+      const result = await aiSession.prompt(buildPrompt(item.text, patterns, userPatterns));
       const rawOutput = result.trim();
       let isSlop = false, confidence = 50;
       try {
@@ -394,12 +470,23 @@ async function drainQueue() {
 }
 
 // ── Prompt builder ────────────────────────────────────────────────────────
-function buildPrompt(text, patterns) {
+function buildPrompt(text, patterns, userPatterns) {
   const patternList = patterns.map(p => `- ${p}`).join("\n");
+  // User-taught patterns get their own clearly-labeled section so the model
+  // treats them as targeted, recent signals rather than folding them into
+  // the general rule set.
+  let userSection = "";
+  if (userPatterns && userPatterns.length > 0) {
+    const userList = userPatterns.map(u => `- ${u.text}`).join("\n");
+    userSection = `
+
+RECENTLY USER-FLAGGED PATTERNS — the user explicitly flagged posts with these traits as slop the filter missed. Treat a match here as strong evidence of slop:
+${userList}`;
+  }
   return `You are an extremely cynical LinkedIn/Twitter slop detector. Classify as slop (1) or authentic (0).
 
 SLOP PATTERNS — classify as 1 if ANY of these are present:
-${patternList}
+${patternList}${userSection}
 
 AUTHENTIC — classify as 0 ONLY if:
 - Contains actual code, specific error messages, or technical implementation detail
@@ -450,9 +537,40 @@ function setBadgeIdle(tabId) {
   chrome.action.setTitle({ title: "SlopRadar", tabId });
 }
 
+// ── Log ring buffer ───────────────────────────────────────────────────────
+// The content scripts forward their scraper/sweep logs here; the Settings
+// page polls getLogs to render a live log window.
+const LOG_BUFFER_MAX = 300;
+let logBuffer = [];
+
+function pushLog(line, host, ts) {
+  logBuffer.push({
+    line: String(line || ""),
+    host: host || "",
+    ts: ts || Date.now(),
+  });
+  if (logBuffer.length > LOG_BUFFER_MAX) {
+    logBuffer = logBuffer.slice(-LOG_BUFFER_MAX);
+  }
+}
+
 // ── Message handler ───────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === "log") { console.log(request.text); return true; }
+  if (request.action === "log") {
+    pushLog(request.line ?? request.text, request.host, request.ts);
+    return false;
+  }
+
+  if (request.action === "getLogs") {
+    sendResponse({ logs: logBuffer });
+    return true;
+  }
+
+  if (request.action === "clearLogs") {
+    logBuffer = [];
+    sendResponse({ ok: true });
+    return true;
+  }
 
   if (request.action === "getTabId") {
     sendResponse({ tabId: sender.tab?.id ?? null });
@@ -514,6 +632,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  // Right-click "mark as slop" — modular teaching into userTaughtPatterns
+  if (request.action === "teachMissedPost") {
+    teachFromMissedPost(request.postText).then(res => sendResponse(res));
+    return true;
+  }
+
+  if (request.action === "getUserPatterns") {
+    getUserPatterns().then(list => sendResponse({ patterns: list }));
+    return true;
+  }
+
+  if (request.action === "removeUserPattern") {
+    getUserPatterns().then(list => {
+      const next = list.filter((u, i) => i !== request.index);
+      return saveUserPatterns(next).then(() => sendResponse({ ok: true, patterns: next }));
+    });
+    return true;
+  }
+
+  if (request.action === "clearUserPatterns") {
+    saveUserPatterns([]).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
   if (request.action === "compactPatterns") {
     maybeCompactPatterns().then(() => getPatterns()).then(p => sendResponse({ ok: true, patterns: p }));
     return true;
@@ -555,4 +697,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     enqueue(tabId, request.text, sendResponse);
     return true;
   }
+});
+
+// ── Context menu — right-click "mark as slop" ────────────────────────────
+// Mirrors AdBlock's "Block this ad" UX: right-click a post the filter
+// missed → teach SlopRadar from it → the post is removed immediately.
+const CTX_MENU_ID = "slopradar_mark_slop";
+
+function createContextMenu() {
+  try {
+    chrome.contextMenus.removeAll(() => {
+      chrome.contextMenus.create({
+        id: CTX_MENU_ID,
+        title: "SlopRadar: mark this as slop",
+        contexts: ["page", "selection", "link", "image"],
+        documentUrlPatterns: [
+          "*://*.x.com/*", "*://*.twitter.com/*", "*://*.linkedin.com/*",
+        ],
+      });
+    });
+  } catch (err) {
+    console.error("[SlopRadar] context menu create failed:", err);
+  }
+}
+
+chrome.runtime.onInstalled.addListener(createContextMenu);
+chrome.runtime.onStartup.addListener(createContextMenu);
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== CTX_MENU_ID || !tab?.id) return;
+  // Tell the content script to act on the element that was right-clicked.
+  // The content script tracks the last contextmenu target itself.
+  chrome.tabs.sendMessage(tab.id, {
+    action: "markRightClickedAsSlop",
+    selectionText: info.selectionText || "",
+  }).catch(() => {});
 });

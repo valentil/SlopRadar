@@ -351,3 +351,202 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
 });
 
 loadPausedSites();
+
+// ── Log window ────────────────────────────────────────────────────────────
+const logWindow = document.getElementById("log-window");
+const logCount = document.getElementById("log-count");
+const logAutoscroll = document.getElementById("log-autoscroll");
+const logPause = document.getElementById("log-pause");
+let lastLogCount = -1;
+
+function fmtLogTime(ts) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function loadLogs() {
+  if (logPause && logPause.checked) return;
+  chrome.runtime.sendMessage({ action: "getLogs" }, (res) => {
+    if (chrome.runtime.lastError || !res || !logWindow) return;
+    const logs = res.logs || [];
+    if (logs.length === lastLogCount) return;
+    lastLogCount = logs.length;
+
+    if (logs.length === 0) {
+      logWindow.innerHTML =
+        '<span style="color:#6e7681">No activity yet — open X or LinkedIn in a tab.</span>';
+      if (logCount) logCount.textContent = "0 lines";
+      return;
+    }
+
+    logWindow.innerHTML = logs.map(entry => {
+      const time = `<span style="color:#6e7681">${fmtLogTime(entry.ts)}</span>`;
+      const host = entry.host
+        ? `<span style="color:#58a6ff">${escapeHtml(entry.host)}</span> `
+        : "";
+      let lineColor = "#c9d1d9";
+      const lower = (entry.line || "").toLowerCase();
+      if (lower.includes("\u26a0") || lower.includes("error") || lower.includes("not responding")) {
+        lineColor = "#f0883e";
+      } else if (lower.includes("enqueued") && !lower.includes("enqueued 0")) {
+        lineColor = "#7ee787";
+      }
+      const line = `<span style="color:${lineColor}">${escapeHtml(entry.line)}</span>`;
+      return `${time} ${host}${line}`;
+    }).join("\n");
+
+    if (logCount) logCount.textContent = `${logs.length} line${logs.length === 1 ? "" : "s"}`;
+    if (logAutoscroll && logAutoscroll.checked) logWindow.scrollTop = logWindow.scrollHeight;
+  });
+}
+
+const logClearBtn = document.getElementById("log-clear-btn");
+if (logClearBtn) {
+  logClearBtn.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ action: "clearLogs" }, () => {
+      lastLogCount = -1;
+      loadLogs();
+      toast("Logs cleared");
+    });
+  });
+}
+
+setInterval(() => {
+  const logsPanel = document.getElementById("panel-logs");
+  if (logsPanel && logsPanel.classList.contains("active")) loadLogs();
+}, 1000);
+
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  if (btn.dataset.tab === "logs") {
+    btn.addEventListener("click", () => { lastLogCount = -1; loadLogs(); });
+  }
+});
+
+// ── Excluded sites (universal mode) ───────────────────────────────────────
+function loadExcludedSites() {
+  const list = document.getElementById("s-excluded-list");
+  if (!list) return;
+  chrome.runtime.sendMessage({ action: "getSettings" }, (s) => {
+    if (chrome.runtime.lastError || !s) return;
+    const sites = s.excludedSites || [];
+    if (sites.length === 0) {
+      list.innerHTML =
+        '<span style="font-size:0.7rem;color:var(--text2)">No custom exclusions. ' +
+        'Common sites (ChatGPT, Claude, Gmail, etc.) are skipped automatically.</span>';
+      return;
+    }
+    list.innerHTML = sites.map(host =>
+      `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:0.75rem">
+        <span style="flex:1;color:var(--text2)">${escapeHtml(host)}</span>
+        <button class="btn" data-exclude="${escapeHtml(host)}" style="font-size:0.65rem;padding:2px 8px">Remove</button>
+      </div>`
+    ).join("");
+    list.querySelectorAll("[data-exclude]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const host = btn.dataset.exclude;
+        chrome.runtime.sendMessage({ action: "getSettings" }, (cur) => {
+          const next = (cur.excludedSites || []).filter(h => h !== host);
+          chrome.runtime.sendMessage(
+            { action: "saveSettings", settings: { ...cur, excludedSites: next } },
+            () => { loadExcludedSites(); toast(`Removed ${host}`); }
+          );
+        });
+      });
+    });
+  });
+}
+
+const excludeAddBtn = document.getElementById("s-exclude-add-btn");
+if (excludeAddBtn) {
+  excludeAddBtn.addEventListener("click", () => {
+    const input = document.getElementById("s-exclude-input");
+    const raw = ((input && input.value) || "").trim().toLowerCase()
+      .replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+    if (!raw) return;
+    chrome.runtime.sendMessage({ action: "getSettings" }, (cur) => {
+      const existing = cur.excludedSites || [];
+      if (existing.includes(raw)) { toast("Already excluded"); return; }
+      chrome.runtime.sendMessage(
+        { action: "saveSettings", settings: { ...cur, excludedSites: [...existing, raw] } },
+        () => { input.value = ""; loadExcludedSites(); toast(`Excluded ${raw}`); }
+      );
+    });
+  });
+}
+
+loadExcludedSites();
+
+// ── User-taught patterns (right-click teaching) ───────────────────────────
+function renderUserPatterns(list) {
+  const box = document.getElementById("user-pattern-list");
+  const count = document.getElementById("user-patterns-count");
+  if (!box) return;
+  if (count) count.textContent = `${list.length}`;
+
+  if (list.length === 0) {
+    box.innerHTML =
+      '<span style="font-size:0.7rem;color:var(--text2)">' +
+      'None yet — right-click a missed post on X or LinkedIn and choose ' +
+      '“SlopRadar: mark this as slop”.</span>';
+    return;
+  }
+
+  box.innerHTML = "";
+  list.forEach((entry, i) => {
+    const tag = document.createElement("div");
+    tag.className = "pattern-tag";
+    const src = entry.source
+      ? `<span style="font-size:0.62rem;color:var(--text2);display:block;margin-top:2px">from: ${escHtml(entry.source)}</span>`
+      : "";
+    tag.innerHTML = `
+      <span class="ptxt">${escHtml(entry.text)}${src}</span>
+      <button class="pdel" title="Remove" data-uidx="${i}">✕</button>
+    `;
+    box.appendChild(tag);
+  });
+
+  box.querySelectorAll(".pdel").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.uidx, 10);
+      chrome.runtime.sendMessage({ action: "removeUserPattern", index: idx }, (res) => {
+        if (chrome.runtime.lastError || !res) return;
+        renderUserPatterns(res.patterns || []);
+        toast("Removed taught pattern");
+      });
+    });
+  });
+}
+
+function loadUserPatterns() {
+  chrome.runtime.sendMessage({ action: "getUserPatterns" }, (res) => {
+    if (chrome.runtime.lastError || !res) return;
+    renderUserPatterns(res.patterns || []);
+  });
+}
+
+const userClearBtn = document.getElementById("user-clear-btn");
+if (userClearBtn) {
+  userClearBtn.addEventListener("click", () => {
+    if (!confirm("Clear all right-click taught patterns?")) return;
+    chrome.runtime.sendMessage({ action: "clearUserPatterns" }, () => {
+      renderUserPatterns([]);
+      toast("Cleared taught patterns");
+    });
+  });
+}
+
+// Refresh taught patterns whenever the Patterns tab is opened
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  if (btn.dataset.tab === "patterns") {
+    btn.addEventListener("click", loadUserPatterns);
+  }
+});
+
+loadUserPatterns();
