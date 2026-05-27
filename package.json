@@ -2,12 +2,16 @@
   "name": "slopradar-tests",
   "version": "1.0.0",
   "private": true,
-  "description": "Local test suite for the SlopRadar extension",
+  "description": "Local test suite + dev tooling for the SlopRadar extension",
   "scripts": {
-    "test": "node test.js",
-    "test:ci": "node run-tests.js"
+    "test": "node run-tests.js",
+    "report": "node build-report.js",
+    "serve": "node serve-report.js",
+    "package": "node ../package.js",
+    "ship": "node run-tests.js && node build-report.js && node ../package.js --open",
+    "watch": "node ../package.js --watch"
   },
   "dependencies": {
-    "jsdom": "^24.1.3"
+    "jsdom": "^24.0.0"
   }
 }

@@ -273,7 +273,7 @@
 <body>
 <div class="header">
   <h1>🚫 SlopRadar</h1>
-  <span class="sub">AI feed filter — v1.3</span>
+  <span class="sub" id="header-version">AI feed filter</span>
   <button id="pause-btn" style="margin-left:auto;font-size:0.7rem;font-weight:800;padding:4px 12px;border-radius:5px;border:1px solid rgba(255,255,255,0.3);background:rgba(255,255,255,0.12);color:#fff;cursor:pointer;letter-spacing:0.05rem;transition:background 0.15s">⏸ PAUSE</button>
 </div>
 
@@ -488,17 +488,30 @@
 
     <div style="margin-top:22px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <div class="setting-group-title" style="margin:0">Right-click taught patterns</div>
+        <div class="setting-group-title" style="margin:0">Right-click page fingerprints</div>
         <span class="patterns-count" id="user-patterns-count" style="margin-left:0"></span>
         <button class="btn danger" id="user-clear-btn"
           style="margin-left:auto;font-size:0.65rem;padding:3px 9px">Clear all</button>
       </div>
       <div style="font-size:0.68rem;color:var(--text2);margin-bottom:8px">
-        Patterns the local model extracted when you right-clicked a missed post and chose
-        “mark this as slop”. Kept separate from the core list so they stay modular and don’t
-        get merged away.
+        Narrow text fingerprints extracted when you right-click a missed post. <b>Page-side only</b>
+        — help quick-match near-identical posts without an AI call but are <em>not</em> sent to the
+        classification prompt (unlike the core patterns above).
       </div>
       <div class="pattern-list" id="user-pattern-list" style="max-height:240px"></div>
+    </div>
+
+    <div style="margin-top:22px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <div class="setting-group-title" style="margin:0">Not-slop correction log</div>
+        <span class="patterns-count" id="notslop-log-count" style="margin-left:0"></span>
+        <button class="btn danger" id="notslop-log-clear-btn"
+          style="margin-left:auto;font-size:0.65rem;padding:3px 9px">Clear</button>
+      </div>
+      <div style="font-size:0.68rem;color:var(--text2);margin-bottom:8px">
+        Every "Not slop" correction — what patterns were removed or narrowed and why.
+      </div>
+      <div id="notslop-log-list" style="max-height:260px;overflow-y:auto"></div>
     </div>
   </div>
 </div>

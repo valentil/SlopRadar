@@ -5,6 +5,14 @@ const IS_LINKEDIN = location.hostname.includes("linkedin.com");
 const PAGE_HOSTNAME = location.hostname;
 const PLATFORM = IS_TWITTER ? "twitter" : IS_LINKEDIN ? "linkedin" : "universal";
 
+// Minimum post length to even consider for classification. Posts below this
+// floor are skipped entirely — they don't carry enough signal for the model
+// to reliably distinguish authentic chatter from short slop, and trying
+// burns AI tokens on conversational replies that are usually fine.
+// The prompt itself also has length-aware guidance for posts in the
+// "short but worth classifying" range (see buildPrompt in background.js).
+const MIN_POST_CHARS = 20;
+
 // ── Default-excluded sites ────────────────────────────────────────────────
 // Universal mode scans any page, but these sites have no "slop feed" to
 // filter and scanning them is pure overhead (or actively annoying — e.g.
@@ -491,19 +499,38 @@ function isInsideModal(el) {
 function getLinkedInWrapper(textNode) {
   if (isInsideModal(textNode)) return null;
 
-  // Reject comment text — comments live in comment-specific containers.
+  // Reject comment text — comments also use expandable-text-box and
+  // role="listitem" internally. Without this guard we'd try to classify
+  // comment replies as feed posts.
   if (textNode.closest('.comments-comment-item, .comments-comments-list, ' +
       '[class*="comment-item"], [class*="comments-"]')) {
     return null;
   }
+  // Secondary comment guard: if the nearest listitem does NOT contain
+  // the "Feed post" h2 that LinkedIn puts on every feed card, it's a
+  // comment or some other non-feed listitem — skip it.
+  // (This catches comment listitems that don't have the old class names.)
 
-  // ── Primary: the post card ──────────────────────────────────────────────
-  // LinkedIn's current feed wraps each post in [role="listitem"]. The post
-  // body (data-testid="expandable-text-box") sits ~15 levels inside it.
-  // This is the most reliable handle on the new feed DOM.
+  // ── Primary: [role="listitem"] that is a feed card ─────────────────────
+  // All LinkedIn feed cards — regular, Suggested, "For You", "Finds this
+  // insightful" — share this structure:
+  //   <div role="listitem" componentkey="expanded...FeedType_...">
+  //     <h2><span>Feed post</span></h2>   ← stable indicator
+  //     ...
+  //     <span data-testid="expandable-text-box">POST TEXT</span>
+  //     ...
+  //   </div>
+  // There is NO outer listitem wrapping the label — "Suggested" is a <p>
+  // INSIDE the same single listitem as the post content.
   const listitem = textNode.closest('[role="listitem"]');
   if (listitem && !isInsideModal(listitem)) {
-    return listitem;
+    // Validate it's a feed card (not a comment/nav listitem) by checking
+    // for the "Feed post" h2 LinkedIn injects into every card.
+    const hasFeedH2 = !!listitem.querySelector('h2 span._482149db, h2 [class*="482149db"]');
+    // Fallback: componentkey containing "FeedType" is equally reliable.
+    const ck = listitem.getAttribute('componentkey') || '';
+    const isFeedCard = hasFeedH2 || ck.includes('FeedType') || ck.startsWith('expanded');
+    if (isFeedCard) return listitem;
   }
 
   // ── Fallback: legacy card selectors (older / un-migrated surfaces) ──────
@@ -577,14 +604,78 @@ function killMedia(container) {
   // The .sr_blur_cover / collapse CSS already hides media visually.
 }
 
-// ── Learn from slop ───────────────────────────────────────────────────────
-function learnFromPost(postText, btn) {
+// ── Inline page feedback toast ────────────────────────────────────────────
+// Shows a transient feedback element near the post so the user knows exactly
+// what happened to the pattern list — whether something was added, was already
+// covered, or nothing changed.
+function showPatternFeedback(wrapper, { icon, headline, detail, color }) {
+  // Remove any existing feedback on this wrapper first.
+  wrapper.querySelector(".sr_pattern_feedback")?.remove();
+
+  const fb = document.createElement("div");
+  fb.className = "sr_pattern_feedback";
+  fb.style.cssText = `
+    position:absolute !important; bottom:100% !important; left:0 !important; right:0 !important;
+    background:${color || "rgba(30,30,40,0.97)"} !important;
+    color:#fff !important; padding:10px 14px !important;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif !important;
+    font-size:0.74rem !important; line-height:1.4 !important;
+    border-radius:6px 6px 0 0 !important;
+    box-shadow:0 -4px 16px rgba(0,0,0,0.35) !important;
+    z-index:2147483647 !important; pointer-events:none !important;
+  `;
+
+  const head = document.createElement("div");
+  head.style.cssText = "font-weight:700 !important; margin-bottom:3px !important;";
+  head.textContent = `${icon} ${headline}`;
+
+  const sub = document.createElement("div");
+  sub.style.cssText = "opacity:0.82 !important;";
+  sub.textContent = detail;
+
+  fb.append(head, sub);
+
+  // Needs a positioned parent to anchor to.
+  const pos = window.getComputedStyle(wrapper).position;
+  if (pos === "static") wrapper.style.setProperty("position", "relative", "important");
+
+  wrapper.appendChild(fb);
+  // Fade out after 4s.
+  setTimeout(() => {
+    fb.style.transition = "opacity 0.5s";
+    fb.style.opacity = "0";
+    setTimeout(() => fb.remove(), 600);
+  }, 4000);
+}
+
+// ── Learn from slop (trash-can click on NOT SLOP tag) ─────────────────────
+function learnFromPost(postText, wrapper, btn) {
   btn.textContent = "⏳"; btn.disabled = true;
   chrome.runtime.sendMessage({ action: "learnFromSlop", postText }, (res) => {
-    if (chrome.runtime.lastError || !res?.ok) { btn.textContent = "🗑️"; btn.disabled = false; return; }
-    const n = res.newPatterns?.length ?? 0;
-    btn.textContent = n > 0 ? `✓ +${n}` : "✓";
-    btn.title = n > 0 ? `Learned ${n} new patterns` : "Already covered";
+    if (chrome.runtime.lastError || !res) {
+      btn.textContent = "🗑️"; btn.disabled = false; return;
+    }
+    const n = res.added?.length ?? 0;
+    if (n > 0) {
+      btn.textContent = `✓ +${n}`;
+      showPatternFeedback(wrapper, {
+        icon: "✅",
+        headline: `Added ${n} new slop pattern${n > 1 ? "s" : ""}`,
+        detail: res.added.map(p => `"${p}"`).join("  ·  "),
+        color: "rgba(16,100,30,0.96)",
+      });
+    } else {
+      btn.textContent = "✓";
+      showPatternFeedback(wrapper, {
+        icon: "ℹ️",
+        headline: "Already covered",
+        detail: res.covered?.length
+          ? `Covered by: ${res.covered.slice(0, 2).join("  ·  ")}`
+          : (res.reasoning || "This pattern is already in the filter."),
+        color: "rgba(30,30,50,0.97)",
+      });
+    }
+    srLog(`learnFromSlop: added ${n}, covered ${res.covered?.length ?? 0}: ${res.reasoning || ""}`);
   });
 }
 
@@ -592,8 +683,8 @@ function learnFromPost(postText, btn) {
 function uncategorizeSlop(wrapper, postText, btn) {
   btn.textContent = "⏳"; btn.disabled = true;
   chrome.runtime.sendMessage({ action: "unlearn", postText }, (res) => {
-    if (chrome.runtime.lastError || !res?.ok) { btn.textContent = "✗"; btn.disabled = false; return; }
-    // Visually revert: remove slop marks, add not-slop tag
+    if (chrome.runtime.lastError || !res) { btn.textContent = "✗"; btn.disabled = false; return; }
+    // Visually revert: remove slop marks, add not-slop tag.
     wrapper.removeAttribute("data-slop-detected");
     wrapper.removeAttribute("data-sr-revealed");
     wrapper.querySelector(".slop_dog_ear")?.remove();
@@ -602,35 +693,67 @@ function uncategorizeSlop(wrapper, postText, btn) {
     wrapper.classList.remove("sr_hide_mode");
     wrapper.style.removeProperty("max-height");
     wrapper.style.removeProperty("overflow");
-    // Update cache — keyed on the post text so it survives navigation
     cacheSetVerdict(postText, false, 0);
-    evaluatedWrappers.delete(wrapper); // allow re-stamp
-    applyNotSlop(wrapper, 0, true);   // force=true skips evaluated check
-    srLog("Uncategorized as NOT SLOP");
+    evaluatedWrappers.delete(wrapper);
+    applyNotSlop(wrapper, 0, true);
+
+    // Inline feedback.
+    const r = res.removed || 0, n = res.narrowed || 0;
+    if (r > 0 || n > 0) {
+      const parts = [];
+      if (r > 0) parts.push(`Removed ${r}: ${(res.removedPatterns || []).slice(0,2).map(p=>`"${p}"`).join(", ")}`);
+      if (n > 0) parts.push(`Narrowed ${n}: ${(res.narrowedPatterns || []).slice(0,2).map(p=>`"${p}"`).join(", ")}`);
+      showPatternFeedback(wrapper, {
+        icon: "🔧",
+        headline: "Patterns updated — not slop",
+        detail: parts.join("  ·  ") + (res.reasoning ? `  —  ${res.reasoning}` : ""),
+        color: "rgba(10,60,90,0.97)",
+      });
+    } else {
+      showPatternFeedback(wrapper, {
+        icon: "ℹ️",
+        headline: "Marked as not slop",
+        detail: res.reasoning || "No patterns changed — may be borderline content.",
+        color: "rgba(30,30,50,0.97)",
+      });
+    }
+    srLog(`unlearn: removed ${r}, narrowed ${n}: ${res.reasoning || ""}`);
   });
 }
 
-// Confirm a slop verdict was correct — reinforces the model. Mirrors the
-// "not slop" flow but in the positive direction: the post is run through
-// the local model (teachMissedPost) to extract confirming patterns into the
-// modular userTaughtPatterns bucket, so similar posts get caught next time.
+// ── Confirm slop (confirm-slop button on slop banner) ─────────────────────
+// Writes confirmed patterns into slopPatterns (the top prompt list).
 function confirmSlop(wrapper, postText, btn) {
   btn.textContent = "⏳"; btn.disabled = true;
-  chrome.runtime.sendMessage({ action: "teachMissedPost", postText }, (res) => {
+  chrome.runtime.sendMessage({ action: "confirmSlop", postText }, (res) => {
     if (chrome.runtime.lastError || !res) {
       btn.textContent = "✗ retry"; btn.disabled = false;
       srLog("confirm slop: background did not respond");
       return;
     }
-    btn.textContent = "✓ Learned";
-    btn.classList.add("sr_confirmed");
-    // keep it disabled — it's been confirmed, no need to click again
-    if (res.ok && res.patterns && res.patterns.length > 0) {
-      srLog(`confirm slop: reinforced with ${res.patterns.length} pattern(s): ` +
-        res.patterns.join(" | "));
+    const n = res.added?.length ?? 0;
+    if (n > 0) {
+      btn.textContent = "✓ Learned";
+      btn.classList.add("sr_confirmed");
+      showPatternFeedback(wrapper, {
+        icon: "✅",
+        headline: `Confirmed slop — added ${n} pattern${n > 1 ? "s" : ""}`,
+        detail: res.added.map(p => `"${p}"`).join("  ·  "),
+        color: "rgba(140,20,20,0.96)",
+      });
     } else {
-      srLog(`confirm slop: ${res.note || "already well covered"}`);
+      btn.textContent = "✓ Covered";
+      btn.classList.add("sr_confirmed");
+      showPatternFeedback(wrapper, {
+        icon: "ℹ️",
+        headline: "Already well covered",
+        detail: res.covered?.length
+          ? `Covered by: ${res.covered.slice(0, 2).join("  ·  ")}`
+          : (res.reasoning || "This pattern is already in the filter."),
+        color: "rgba(80,20,20,0.96)",
+      });
     }
+    srLog(`confirmSlop: added ${n}: ${res.reasoning || ""}`);
   });
 }
 
@@ -823,7 +946,7 @@ function applyNotSlop(wrapper, confidence, force = false, fromCache = false) {
         const tb = document.createElement("button");
         tb.className = "not_slop_tw_trash_btn"; tb.textContent = "🗑️";
         tb.title = "Actually slop? Teach SlopRadar";
-        tb.addEventListener("click", (e) => { e.stopPropagation(); learnFromPost(postText, tb); });
+        tb.addEventListener("click", (e) => { e.stopPropagation(); learnFromPost(postText, wrapper, tb); });
         wrap.appendChild(tb);
       }
       timeEl.parentElement.insertAdjacentElement("afterend", wrap);
@@ -847,7 +970,7 @@ function applyNotSlop(wrapper, confidence, force = false, fromCache = false) {
       const tb = document.createElement("button");
       tb.className = "not_slop_trash_btn"; tb.textContent = "🗑️";
       tb.title = "Actually slop? Teach SlopRadar";
-      tb.addEventListener("click", (e) => { e.stopPropagation(); learnFromPost(postText, tb); });
+      tb.addEventListener("click", (e) => { e.stopPropagation(); learnFromPost(postText, wrapper, tb); });
       ear.appendChild(tb);
     }
 
@@ -893,7 +1016,7 @@ async function drainOne() {
   }
 
   const rawText = (textNode.textContent || "").trim();
-  if (rawText.length < 40) {
+  if (rawText.length < MIN_POST_CHARS) {
     requestAnimationFrame(drainOne); return;
   }
 
@@ -972,7 +1095,7 @@ function scheduleDrain() {
 function enqueueNode(textNode) {
   if (isComposerOrInput(textNode)) return;
   const rawText = (textNode.textContent || "").trim();
-  if (rawText.length < 40) return;
+  if (rawText.length < MIN_POST_CHARS) return;
 
   // Dedup — but handle recycled nodes (X reuses <article> elements as you
   // scroll; the same DOM node ends up holding a different tweet). If the
@@ -1228,7 +1351,7 @@ function sweep() {
   rawMatches.forEach(node => {
     if (isComposerOrInput(node)) { rejectedComposer++; return; }
     const txt = (node.textContent || "").trim();
-    if (txt.length < 40) { rejectedShort++; return; }
+    if (txt.length < MIN_POST_CHARS) { rejectedShort++; return; }
     const before = pendingNodes.length;
     const wrapper = getPostWrapper(node);
     if (!wrapper) { rejectedNoWrapper++; return; }

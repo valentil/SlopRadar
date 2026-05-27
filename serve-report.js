@@ -1,4 +1,4 @@
-// serve-report.js — serves report.html + fixtures, handles POST /__push.
+// serve-report.js — serves report.html + fixtures, handles POST /__push and /__package.
 // Usage: node serve-report.js [--port 8731]
 
 const http = require("http");
@@ -7,7 +7,19 @@ const path = require("path");
 const { execFile } = require("child_process");
 
 const HERE = __dirname;
-const EXT_DIR = path.resolve(HERE, "..");
+
+// Find the extension dir — same folder as the tests, or the parent.
+function findExtDir() {
+  const candidates = [HERE, path.resolve(HERE, ".."), process.cwd()];
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, "manifest.json")) &&
+        fs.existsSync(path.join(dir, "background.js"))) {
+      return dir;
+    }
+  }
+  return HERE; // fall back; git ops will report a clear error
+}
+const EXT_DIR = findExtDir();
 const portArg = process.argv.indexOf("--port");
 const PORT = portArg !== -1 ? parseInt(process.argv[portArg + 1], 10) : 8731;
 
@@ -23,7 +35,6 @@ function send(res, code, body, type = "text/plain") {
 
 // Run git in the extension directory
 function gitPush(cb) {
-  // First verify EXT_DIR is actually a git repo
   execFile("git", ["-C", EXT_DIR, "rev-parse", "--is-inside-work-tree"], (e0) => {
     if (e0) {
       return cb({
@@ -31,23 +42,16 @@ function gitPush(cb) {
         message: "Not a git repo. Run: git init && git remote add origin <url>",
       });
     }
-
-    // Stage everything
     execFile("git", ["-C", EXT_DIR, "add", "-A"], (e1, o1, err1) => {
       if (e1) return cb({ ok: false, message: "git add failed: " + (err1 || e1.message) });
-
-      // Anything to commit?
       execFile("git", ["-C", EXT_DIR, "status", "--porcelain"], (e2, statusOut) => {
         if (e2) return cb({ ok: false, message: "git status failed" });
         if (!statusOut.trim()) {
           return cb({ ok: true, message: "Nothing to commit — working tree clean" });
         }
-
         const msg = "SlopRadar: verified by local test suite (" + new Date().toISOString() + ")";
         execFile("git", ["-C", EXT_DIR, "commit", "-m", msg], (e3, o3, err3) => {
           if (e3) return cb({ ok: false, message: "git commit failed: " + (err3 || e3.message) });
-
-          // Check a remote exists before pushing
           execFile("git", ["-C", EXT_DIR, "remote"], (e4, remoteOut) => {
             if (e4 || !remoteOut.trim()) {
               return cb({
@@ -66,6 +70,34 @@ function gitPush(cb) {
   });
 }
 
+// Run the packager and return the result.
+function packageExtension(cb) {
+  const packageScript = path.join(EXT_DIR, "package.js");
+  if (!fs.existsSync(packageScript)) {
+    return cb({ ok: false, message: "package.js not found in " + EXT_DIR });
+  }
+  execFile("node", [packageScript], { cwd: EXT_DIR }, (err, stdout, stderr) => {
+    if (err) {
+      return cb({ ok: false, message: (stderr || err.message || String(err)).trim() });
+    }
+    // Try to read the build-info.json the packager writes.
+    try {
+      const info = JSON.parse(
+        fs.readFileSync(path.join(EXT_DIR, "dist", "build-info.json"), "utf8")
+      );
+      cb({
+        ok: true,
+        message: `Built dist/${info.zipName} (${(info.bytes / 1024).toFixed(1)} KB) — drag it to chrome://extensions to load`,
+        zipName: info.zipName,
+        version: info.version,
+        bytes: info.bytes,
+      });
+    } catch (_) {
+      cb({ ok: true, message: stdout.trim() || "Package built" });
+    }
+  });
+}
+
 const server = http.createServer((req, res) => {
   // ── Push endpoint ──
   if (req.method === "POST" && req.url === "/__push") {
@@ -75,11 +107,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── Package endpoint ──
+  if (req.method === "POST" && req.url === "/__package") {
+    packageExtension((result) => {
+      send(res, result.ok ? 200 : 500, JSON.stringify(result), "application/json");
+    });
+    return;
+  }
+
   // ── Static files ──
   let urlPath = req.url.split("?")[0];
   if (urlPath === "/") urlPath = "/report.html";
 
-  // Serve from test dir; allow fixtures/ subdir
   const safePath = path.normalize(urlPath).replace(/^(\.\.[/\\])+/, "");
   const filePath = path.join(HERE, safePath);
 

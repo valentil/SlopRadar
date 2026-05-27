@@ -83,26 +83,40 @@ async function getPauseState() {
 async function setPauseState(paused) {
   pausedState = paused;
   await storageSet({ paused });
-  // Update badge
+  // Notify content scripts on supported tabs so they apply the pause locally.
   const tabs = await new Promise(r => chrome.tabs.query({}, r));
   for (const tab of tabs) {
     if (tab.id && isSupportedUrl(tab.url || "")) {
       chrome.tabs.sendMessage(tab.id, { action: "pauseStateChanged", paused }).catch(() => {});
     }
   }
-  // Reflect in extension icon title
+  // Badge: emoji renders inconsistently in the toolbar badge — plain text is
+  // reliable across platforms and pinned/unpinned states.
   chrome.action.setTitle({ title: paused ? "SlopRadar — Paused" : "SlopRadar — Active" });
   if (paused) {
-    // Show P badge on all active tabs
-    tabs.filter(t => isSupportedUrl(t.url || "")).forEach(t => {
-      chrome.action.setBadgeText({ text: "⏸", tabId: t.id });
-      chrome.action.setBadgeBackgroundColor({ color: "#6b7280", tabId: t.id });
-    });
+    // Global pause: clear per-tab badges and set a default that shows
+    // regardless of which tab is active.
+    chrome.action.setBadgeBackgroundColor({ color: "#6b7280" });
+    chrome.action.setBadgeText({ text: "OFF" });
+    // Also overwrite any per-tab badges so the pinned icon reflects pause
+    // immediately on every tab, not just the active one.
+    for (const tab of tabs) {
+      if (!tab.id) continue;
+      chrome.action.setBadgeText({ text: "OFF", tabId: tab.id });
+      chrome.action.setBadgeBackgroundColor({ color: "#6b7280", tabId: tab.id });
+    }
   } else {
-    tabs.filter(t => isSupportedUrl(t.url || "")).forEach(t => {
-      chrome.action.setBadgeText({ text: "ON", tabId: t.id });
-      chrome.action.setBadgeBackgroundColor({ color: "#e02424", tabId: t.id });
-    });
+    // Unpaused: clear the default, restore per-tab state.
+    chrome.action.setBadgeText({ text: "" });
+    for (const tab of tabs) {
+      if (!tab.id) continue;
+      if (isSupportedUrl(tab.url || "")) {
+        chrome.action.setBadgeText({ text: "ON", tabId: tab.id });
+        chrome.action.setBadgeBackgroundColor({ color: "#e02424", tabId: tab.id });
+      } else {
+        chrome.action.setBadgeText({ text: "", tabId: tab.id });
+      }
+    }
   }
 }
 
@@ -163,11 +177,48 @@ async function initEngine() {
 chrome.runtime.onInstalled.addListener(initEngine);
 chrome.runtime.onStartup.addListener(initEngine);
 
-// ── Teach from a missed post (right-click "mark as slop") ────────────────
-// Modular by design: the model extracts patterns FROM THIS SPECIFIC POST
-// only, and they land in the separate userTaughtPatterns bucket. We pass
-// the existing patterns purely so the model avoids duplicating them — the
-// new ones never get merged into the core list.
+// ── Learn from slop (trash-can / confirm-slop button) ─────────────────────
+// Writes to slopPatterns so the prompt stays complete.
+// Returns { added, covered, reasoning } for rich inline page feedback.
+async function learnFromSlop(postText) {
+  if (!aiSession) return { added: [], covered: [], reasoning: "AI engine not ready" };
+  try {
+    const existing = await getPatterns();
+    const prompt = `You are analyzing a social media post identified as AI-generated slop or engagement bait. Extract 1-3 NEW anti-patterns it demonstrates that are NOT already covered by the existing list. Be specific and generalizable.
+
+Existing patterns (do not repeat these):
+${existing.map((p, i) => `${i + 1}. ${p}`).join("\n")}
+
+Slop post to analyze:
+"""
+${postText.substring(0, 800)}
+"""
+
+Output ONLY a JSON object: { "added": ["new pattern 1", ...], "covered_by": ["existing pattern that already covers this"], "reasoning": "one sentence" }
+Empty array for added if nothing new. No markdown.`;
+
+    const result = await aiSession.prompt(prompt);
+    const clean = result.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(clean);
+    const added = Array.isArray(parsed.added) ? parsed.added.filter(p => p.length > 3) : [];
+    const coveredBy = Array.isArray(parsed.covered_by) ? parsed.covered_by : [];
+    const reasoning = parsed.reasoning || "";
+
+    if (added.length > 0) {
+      await savePatterns([...existing, ...added]);
+      await maybeCompactPatterns();
+      console.log(`[SlopRadar] learnFromSlop: added ${added.length}:`, added);
+    }
+    return { added, covered: coveredBy, reasoning };
+  } catch (err) {
+    console.error("[SlopRadar] learnFromSlop failed:", err);
+    return { added: [], covered: [], reasoning: String(err) };
+  }
+}
+
+// ── Right-click "mark as slop" — page-side text fingerprints ─────────────
+// These are NOT sent to the prompt. They live in userTaughtPatterns as
+// text fingerprints for quick-matching near-identical posts without an AI call.
 async function teachFromMissedPost(postText) {
   if (!aiSession) return { ok: false, reason: "AI engine not ready", patterns: [] };
   try {
@@ -175,17 +226,17 @@ async function teachFromMissedPost(postText) {
     const userPatterns = await getUserPatterns();
     const alreadyKnown = corePatterns.concat(userPatterns.map(u => u.text));
 
-    const prompt = `A user manually flagged the social media post below as AI slop that the filter MISSED. Identify 1-2 specific, generalizable anti-patterns this post demonstrates — focus on what makes THIS post slop. Do not repeat anything already in the known list. Keep each pattern a short phrase (under 12 words), specific enough to catch similar posts but not so broad it would catch genuine content.
+    const prompt = `A user manually flagged this post as slop the filter missed. Extract 1-2 SHORT, specific text fingerprints that identify this post or very similar ones — narrow unique phrases or structural quirks, not broad rules.
 
 Known patterns (do NOT repeat):
-${alreadyKnown.map((p, i) => `${i + 1}. ${p}`).join("\n")}
+${alreadyKnown.slice(0, 30).map((p, i) => `${i + 1}. ${p}`).join("\n")}
 
 The missed slop post:
 """
 ${postText.substring(0, 800)}
 """
 
-Output ONLY a JSON array of 1-2 new pattern strings. No markdown, no explanation.`;
+Output ONLY a JSON array of 1-2 short fingerprint strings. No markdown.`;
 
     const result = await aiSession.prompt(prompt);
     const clean = result.replace(/```json|```/g, "").trim();
@@ -193,22 +244,19 @@ Output ONLY a JSON array of 1-2 new pattern strings. No markdown, no explanation
     try { extracted = JSON.parse(clean); } catch (_) { extracted = []; }
     if (!Array.isArray(extracted)) extracted = [];
 
-    // Filter out empties and anything that duplicates a known pattern.
     const knownLower = new Set(alreadyKnown.map(p => p.toLowerCase().trim()));
-    const fresh = extracted
-      .map(p => String(p).trim())
+    const fresh = extracted.map(p => String(p).trim())
       .filter(p => p.length > 3 && !knownLower.has(p.toLowerCase()));
 
     if (fresh.length === 0) {
-      return { ok: true, patterns: [], note: "No new patterns — already covered." };
+      return { ok: true, patterns: [], note: "No new fingerprints — already covered." };
     }
 
     const snippet = postText.substring(0, 100).replace(/\s+/g, " ").trim();
-    const userPatternsNext = userPatterns.concat(
+    await saveUserPatterns(userPatterns.concat(
       fresh.map(text => ({ text, source: snippet, ts: Date.now() }))
-    );
-    await saveUserPatterns(userPatternsNext);
-    console.log(`[SlopRadar] Taught ${fresh.length} user pattern(s):`, fresh);
+    ));
+    console.log(`[SlopRadar] teachFromMissedPost (page fingerprints):`, fresh);
     return { ok: true, patterns: fresh };
   } catch (err) {
     console.error("[SlopRadar] teachFromMissedPost failed:", err);
@@ -244,46 +292,18 @@ Output (JSON array only):`;
   }
 }
 
-// ── Learn from a new slop example ────────────────────────────────────────
-async function learnFromSlop(postText) {
-  if (!aiSession) return;
-  try {
-    const existing = await getPatterns();
-    const prompt = `You are analyzing a social media post that has been identified as AI-generated slop/engagement bait. Extract 1-3 NEW anti-patterns it demonstrates that are NOT already covered by the existing patterns list. Be specific and generalizable. If no new patterns exist, return an empty array.
-
-Existing patterns (do not repeat these):
-${existing.map((p, i) => `${i + 1}. ${p}`).join("\n")}
-
-Slop post to analyze:
-"""
-${postText.substring(0, 800)}
-"""
-
-Output ONLY a JSON array of new pattern strings. Empty array if none. No markdown, no explanation.`;
-
-    const result = await aiSession.prompt(prompt);
-    const clean = result.replace(/```json|```/g, "").trim();
-    const newPatterns = JSON.parse(clean);
-    if (Array.isArray(newPatterns) && newPatterns.length > 0) {
-      const updated = [...existing, ...newPatterns];
-      await savePatterns(updated);
-      console.log(`[SlopRadar] Learned ${newPatterns.length} new patterns:`, newPatterns);
-      await maybeCompactPatterns();
-      return newPatterns;
-    }
-    return [];
-  } catch (err) {
-    console.error("[SlopRadar] Learn failed:", err);
-    return [];
-  }
-}
-
-// ── Unlearn: remove patterns that match a NOT-slop post ─────────────────
+// ── Unlearn: narrow/remove patterns that over-matched a NOT-slop post ─────
+// Returns rich detail for inline page feedback.
 async function unlearnFromPost(postText) {
-  if (!aiSession) return [];
+  if (!aiSession) return { ok: false, removed: 0, narrowed: 0, removedPatterns: [], narrowedPatterns: [], reasoning: "AI engine not ready" };
   try {
     const existing = await getPatterns();
-    const prompt = `A social media post was incorrectly flagged as slop. Identify which patterns from the list below INCORRECTLY match this post and should be removed or narrowed. Return a JSON object: { "remove": [indices to remove, 0-based], "narrowed": ["replacement text for any patterns that should be more specific rather than removed"] }. If the post is genuinely not slop and certain patterns are too broad, list them.
+    const prompt = `A social media post was INCORRECTLY flagged as slop — the user says it is authentic. Identify which patterns from the list below are too broad and incorrectly match this post.
+
+Return a JSON object:
+{ "remove": [0-based indices to remove], "narrowed": ["replacement text for patterns to make more specific"], "reasoning": "brief explanation" }
+
+If nothing should change, return {"remove":[],"narrowed":[],"reasoning":"post appears borderline, no changes"}.
 
 Patterns:
 ${existing.map((p, i) => `${i}. ${p}`).join("\n")}
@@ -293,23 +313,38 @@ Post (flagged incorrectly as slop):
 ${postText.substring(0, 800)}
 """
 
-Output ONLY valid JSON like {"remove":[2,7],"narrowed":[]}. No markdown.`;
+Output ONLY valid JSON. No markdown.`;
 
     const result = await aiSession.prompt(prompt);
     const parsed = JSON.parse(result.replace(/```json|```/g, "").trim());
-    const toRemove = new Set(parsed.remove || []);
+    const toRemove = new Set((parsed.remove || []).filter(i => typeof i === "number"));
+    const narrowed = Array.isArray(parsed.narrowed) ? parsed.narrowed : [];
+    const reasoning = parsed.reasoning || "";
+    const removedPatterns = existing.filter((_, i) => toRemove.has(i));
     let updated = existing.filter((_, i) => !toRemove.has(i));
-    if (parsed.narrowed?.length) updated = updated.concat(parsed.narrowed);
-    if (updated.length > 5 && updated.length !== existing.length) {
+    if (narrowed.length) updated = updated.concat(narrowed);
+    if (updated.length >= 5 && (toRemove.size > 0 || narrowed.length > 0)) {
       await savePatterns(updated);
-      console.log(`[SlopRadar] Unlearned: removed ${toRemove.size}, narrowed ${parsed.narrowed?.length || 0}`);
-      return { removed: toRemove.size, narrowed: parsed.narrowed?.length || 0 };
+      console.log(`[SlopRadar] unlearnFromPost: removed ${toRemove.size}, narrowed ${narrowed.length}`);
+      return { ok: true, removed: toRemove.size, narrowed: narrowed.length, removedPatterns, narrowedPatterns: narrowed, reasoning };
     }
-    return { removed: 0, narrowed: 0 };
+    return { ok: true, removed: 0, narrowed: 0, removedPatterns: [], narrowedPatterns: [], reasoning: reasoning || "No changes — patterns appear appropriate." };
   } catch (err) {
-    console.error("[SlopRadar] Unlearn failed:", err);
-    return { removed: 0, narrowed: 0 };
+    console.error("[SlopRadar] unlearnFromPost failed:", err);
+    return { ok: false, removed: 0, narrowed: 0, removedPatterns: [], narrowedPatterns: [], reasoning: String(err) };
   }
+}
+
+// ── Not-slop correction log ───────────────────────────────────────────────
+const NOT_SLOP_LOG_MAX = 30;
+async function getNotSlopLog() {
+  const d = await storageGet(["notSlopLog"]);
+  return Array.isArray(d.notSlopLog) ? d.notSlopLog : [];
+}
+async function appendNotSlopLog(entry) {
+  const log = await getNotSlopLog();
+  log.push({ ...entry, ts: Date.now() });
+  await storageSet({ notSlopLog: log.slice(-NOT_SLOP_LOG_MAX) });
 }
 
 // ── Site pause (per-hostname) ─────────────────────────────────────────────
@@ -474,10 +509,9 @@ async function drainQueue() {
 
     const settings = await getSettings();
     const patterns = await getPatterns();
-    const userPatterns = await getUserPatterns();
 
     try {
-      const result = await aiSession.prompt(buildPrompt(item.text, patterns, userPatterns));
+      const result = await aiSession.prompt(buildPrompt(item.text, patterns));
       const rawOutput = result.trim();
       let isSlop = false, confidence = 50;
       try {
@@ -503,23 +537,32 @@ async function drainQueue() {
 }
 
 // ── Prompt builder ────────────────────────────────────────────────────────
-function buildPrompt(text, patterns, userPatterns) {
+// ── Prompt builder ────────────────────────────────────────────────────────
+// Only slopPatterns go into the prompt. userTaughtPatterns are page-side
+// heuristics (text fingerprints for quick-matching), NOT prompt content.
+function buildPrompt(text, patterns) {
   const patternList = patterns.map(p => `- ${p}`).join("\n");
-  // User-taught patterns get their own clearly-labeled section so the model
-  // treats them as targeted, recent signals rather than folding them into
-  // the general rule set.
-  let userSection = "";
-  if (userPatterns && userPatterns.length > 0) {
-    const userList = userPatterns.map(u => `- ${u.text}`).join("\n");
-    userSection = `
+  // Length-aware guidance: short posts (typically replies, casual chatter)
+  // lack the surface area for the rich-content authentic signals — "code,
+  // error messages, narrow falsifiable claims" — so applying those criteria
+  // strictly mis-classifies normal conversation as slop. Give the model an
+  // explicit tier for short text: default to authentic unless a pattern
+  // matches unambiguously.
+  const charCount = text.length;
+  let lengthGuidance = "";
+  if (charCount < 80) {
+    lengthGuidance = `
 
-RECENTLY USER-FLAGGED PATTERNS — the user explicitly flagged posts with these traits as slop the filter missed. Treat a match here as strong evidence of slop:
-${userList}`;
+LENGTH NOTE — this post is short (${charCount} chars). Short posts are usually replies or casual chatter and don't carry enough signal for confident slop detection. Default to authentic (0) UNLESS the text contains an unambiguous slop signature from the pattern list (e.g. obvious engagement bait, motivational platitudes, "nobody talks about this" framing). When in doubt on short text, classify 0 with moderate confidence. Do NOT mark short genuine reactions, questions, agreement, jokes, or short opinions as slop.`;
+  } else if (charCount < 200) {
+    lengthGuidance = `
+
+LENGTH NOTE — this post is medium-length (${charCount} chars). Apply moderate skepticism: require a clear pattern match, not just one weak signal.`;
   }
   return `You are an extremely cynical LinkedIn/Twitter slop detector. Classify as slop (1) or authentic (0).
 
 SLOP PATTERNS — classify as 1 if ANY of these are present:
-${patternList}${userSection}
+${patternList}
 
 AUTHENTIC — classify as 0 ONLY if:
 - Contains actual code, specific error messages, or technical implementation detail
@@ -527,6 +570,7 @@ AUTHENTIC — classify as 0 ONLY if:
 - Makes a narrow, falsifiable claim with evidence
 - Is a genuine question with no performance attached
 - Contains domain-specific jargon used correctly and precisely (not for show)
+- OR is a short reply / casual remark with no slop markers (see LENGTH NOTE below)${lengthGuidance}
 
 Input Text:
 """
@@ -561,11 +605,22 @@ function isSupportedUrl(url) {
   return url.includes("linkedin.com") || url.includes("x.com") || url.includes("twitter.com");
 }
 function setBadgeActive(tabId) {
+  if (pausedState) {
+    chrome.action.setBadgeText({ text: "OFF", tabId });
+    chrome.action.setBadgeBackgroundColor({ color: "#6b7280", tabId });
+    chrome.action.setTitle({ title: "SlopRadar — Paused", tabId });
+    return;
+  }
   chrome.action.setBadgeText({ text: "ON", tabId });
   chrome.action.setBadgeBackgroundColor({ color: "#e02424", tabId });
   chrome.action.setTitle({ title: "SlopRadar — Active", tabId });
 }
 function setBadgeIdle(tabId) {
+  if (pausedState) {
+    chrome.action.setBadgeText({ text: "OFF", tabId });
+    chrome.action.setBadgeBackgroundColor({ color: "#6b7280", tabId });
+    return;
+  }
   chrome.action.setBadgeText({ text: "", tabId });
   chrome.action.setTitle({ title: "SlopRadar", tabId });
 }
@@ -661,13 +716,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "learnFromSlop") {
-    learnFromSlop(request.postText).then(newPatterns => sendResponse({ ok: true, newPatterns }));
+    learnFromSlop(request.postText).then(res => sendResponse({ ok: true, ...res }));
     return true;
   }
 
-  // Right-click "mark as slop" — modular teaching into userTaughtPatterns
+  // Right-click "mark as slop" — page-side text fingerprints into userTaughtPatterns
   if (request.action === "teachMissedPost") {
     teachFromMissedPost(request.postText).then(res => sendResponse(res));
+    return true;
+  }
+
+  // confirm-slop button — same as learnFromSlop, writes to slopPatterns
+  if (request.action === "confirmSlop") {
+    learnFromSlop(request.postText).then(res => sendResponse({ ok: true, ...res }));
     return true;
   }
 
@@ -705,7 +766,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "unlearn") {
-    unlearnFromPost(request.postText).then(res => sendResponse({ ok: true, ...res }));
+    unlearnFromPost(request.postText).then(async res => {
+      if (res.ok && (res.removed > 0 || res.narrowed > 0)) {
+        await appendNotSlopLog({
+          snippet: (request.postText || "").substring(0, 80),
+          removed: res.removed,
+          narrowed: res.narrowed,
+          removedPatterns: res.removedPatterns || [],
+          narrowedPatterns: res.narrowedPatterns || [],
+          reasoning: res.reasoning || "",
+        });
+      }
+      sendResponse(res);
+    });
+    return true;
+  }
+
+  if (request.action === "getNotSlopLog") {
+    getNotSlopLog().then(log => sendResponse({ log }));
+    return true;
+  }
+
+  if (request.action === "clearNotSlopLog") {
+    storageSet({ notSlopLog: [] }).then(() => sendResponse({ ok: true }));
     return true;
   }
 

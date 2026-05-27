@@ -168,9 +168,13 @@ const html = `<!DOCTYPE html>
 
 <div class="footer-bar">
   <span class="fb-status">${allPass
-    ? "✓ All tests green — safe to push"
+    ? "✓ All tests green — safe to push & package"
     : "✗ Tests failing — fix before pushing"}</span>
   <span id="push-out"></span>
+  <button id="pkg-btn" class="${allPass ? "ready" : "blocked"}"
+          ${allPass ? "" : "disabled"} style="margin-right:8px">
+    ${allPass ? "📦 Package .zip" : "Package blocked"}
+  </button>
   <button id="push-btn" class="${allPass ? "ready" : "blocked"}"
           ${allPass ? "" : "disabled"}>
     ${allPass ? "▲ Push to git" : "Push blocked"}
@@ -178,24 +182,24 @@ const html = `<!DOCTYPE html>
 </div>
 
 <script>
-  const btn = document.getElementById("push-btn");
+  const pushBtn = document.getElementById("push-btn");
+  const pkgBtn = document.getElementById("pkg-btn");
   const out = document.getElementById("push-out");
-  const canPush = ${allPass ? "true" : "false"};
+  const canAct = ${allPass ? "true" : "false"};
 
-  btn.addEventListener("click", async () => {
-    if (!canPush) return;
+  async function postEndpoint(url, btn, label) {
     btn.disabled = true;
-    btn.textContent = "Pushing…";
+    btn.textContent = label + "…";
     out.textContent = "";
     try {
-      const res = await fetch("/__push", { method: "POST" });
+      const res = await fetch(url, { method: "POST" });
       const data = await res.json();
       if (data.ok) {
-        btn.textContent = "✓ Pushed";
+        btn.textContent = "✓ " + label + " done";
         btn.style.background = "#137333";
-        out.textContent = data.message || "Pushed successfully";
+        out.textContent = data.message || "Done";
       } else {
-        btn.textContent = "✗ Push failed";
+        btn.textContent = "✗ " + label + " failed";
         btn.style.background = "#e02424";
         out.textContent = data.message || "Unknown error";
         btn.disabled = false;
@@ -206,6 +210,16 @@ const html = `<!DOCTYPE html>
       out.textContent = String(err);
       btn.disabled = false;
     }
+  }
+
+  pkgBtn.addEventListener("click", () => {
+    if (!canAct) return;
+    postEndpoint("/__package", pkgBtn, "Package");
+  });
+
+  pushBtn.addEventListener("click", () => {
+    if (!canAct) return;
+    postEndpoint("/__push", pushBtn, "Push");
   });
 </script>
 </body>

@@ -312,6 +312,13 @@ pauseBtn?.addEventListener("click", () => {
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────
+// Pull version straight from manifest so the header can't go stale.
+try {
+  const v = chrome.runtime.getManifest()?.version;
+  const verEl = document.getElementById("header-version");
+  if (v && verEl) verEl.textContent = `AI feed filter — v${v}`;
+} catch (_) {}
+
 loadStats();
 loadSettings();
 loadPatterns();
@@ -569,3 +576,59 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
 });
 
 loadUserPatterns();
+
+// ── Not-slop correction log ───────────────────────────────────────────────
+function renderNotSlopLog(log) {
+  const list = document.getElementById("notslop-log-list");
+  const count = document.getElementById("notslop-log-count");
+  if (!list) return;
+  if (count) count.textContent = log.length;
+
+  if (log.length === 0) {
+    list.innerHTML = '<span style="font-size:0.7rem;color:var(--text2)">No corrections yet — click "Not slop" on a flagged post to see updates here.</span>';
+    return;
+  }
+
+  list.innerHTML = [...log].reverse().map(entry => {
+    const d = new Date(entry.ts || 0);
+    const r = entry.removed || 0, n = entry.narrowed || 0;
+    const noChange = r === 0 && n === 0;
+    const removedHtml = (entry.removedPatterns || []).slice(0, 3)
+      .map(p => `<div style="color:#f85149;font-size:0.68rem;padding:1px 0">— ${escHtml(p)}</div>`).join("");
+    const narrowedHtml = (entry.narrowedPatterns || []).slice(0, 3)
+      .map(p => `<div style="color:#e3b341;font-size:0.68rem;padding:1px 0">~ ${escHtml(p)}</div>`).join("");
+    return `<div style="padding:7px 0;border-bottom:1px solid var(--border)">
+      <div style="font-size:0.62rem;color:var(--text2)">${d.toLocaleString()}</div>
+      <div style="font-size:0.72rem;color:var(--text);margin:2px 0">"${escHtml((entry.snippet||"").substring(0,60))}…"</div>
+      ${noChange
+        ? `<div style="font-size:0.68rem;color:var(--text2)">${escHtml(entry.reasoning||"No patterns changed")}</div>`
+        : removedHtml + narrowedHtml + (entry.reasoning ? `<div style="font-size:0.68rem;color:var(--text2);margin-top:2px">${escHtml(entry.reasoning)}</div>` : "")}
+    </div>`;
+  }).join("");
+}
+
+function loadNotSlopLog() {
+  chrome.runtime.sendMessage({ action: "getNotSlopLog" }, (res) => {
+    if (chrome.runtime.lastError || !res) return;
+    renderNotSlopLog(res.log || []);
+  });
+}
+
+const notSlopClearBtn = document.getElementById("notslop-log-clear-btn");
+if (notSlopClearBtn) {
+  notSlopClearBtn.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ action: "clearNotSlopLog" }, () => {
+      renderNotSlopLog([]);
+      toast("Cleared not-slop log");
+    });
+  });
+}
+
+// Load when Patterns tab is opened.
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  if (btn.dataset.tab === "patterns") {
+    btn.addEventListener("click", loadNotSlopLog);
+  }
+});
+
+loadNotSlopLog();

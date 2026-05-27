@@ -858,6 +858,102 @@ test("content re-applies a wiped slop block from the verdict cache", () => {
     "re-applies slop when the block was wiped");
 });
 
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 15 — Options wiring: every getElementById call has a target
+// ════════════════════════════════════════════════════════════════════════
+// This catches the exact bug-class where a botched edit truncates an
+// element id in options.html — silently breaking all options.js code that
+// runs after the first failing addEventListener call (because the error
+// halts script execution).
+suite("options-wiring");
+
+test("every getElementById in options.js resolves in options.html", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const dir = findExtDir();
+  const js = fs.readFileSync(path.join(dir, "options.js"), "utf8");
+  const html = fs.readFileSync(path.join(dir, "options.html"), "utf8");
+
+  // Pull every literal id passed to getElementById in options.js.
+  const idRe = /getElementById\(\s*["'`]([a-zA-Z0-9_-]+)["'`]\s*\)/g;
+  const ids = new Set();
+  for (const m of js.matchAll(idRe)) ids.add(m[1]);
+
+  // Collect all ids defined in options.html.
+  const htmlIds = new Set();
+  for (const m of html.matchAll(/\bid=["']([a-zA-Z0-9_-]+)["']/g)) htmlIds.add(m[1]);
+
+  const missing = [...ids].filter(id => !htmlIds.has(id));
+  assert.equal(missing.length, 0,
+    `options.js references id(s) not in options.html: ${missing.join(", ")} ` +
+    `— a missing id throws a TypeError on the first addEventListener and ` +
+    `kills the rest of the script (stats, pause, settings all stop working).`);
+});
+
+test("options.html header version is not hardcoded", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const html = fs.readFileSync(path.join(findExtDir(), "options.html"), "utf8");
+  // Hardcoded "v1.2", "v1.3", ... in the header span — caught with a
+  // tight pattern. If anyone reintroduces a hardcoded version, this fires.
+  assert.ok(!/AI feed filter — v\d/.test(html),
+    "options.html has a hardcoded version string in the header — " +
+    "use chrome.runtime.getManifest().version instead.");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 16 — Length-aware classification
+// ════════════════════════════════════════════════════════════════════════
+// Short posts (replies, casual chatter) lack the surface area to
+// distinguish authentic conversation from slop. We use a hard floor for
+// "don't even classify" plus a prompt nudge for "classify but be lenient".
+suite("length-handling");
+
+test("MIN_POST_CHARS floor is defined and reasonable", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  const m = content.match(/const MIN_POST_CHARS = (\d+)/);
+  assert.ok(m, "MIN_POST_CHARS constant is defined");
+  const n = parseInt(m[1], 10);
+  assert.ok(n >= 5 && n <= 60, `MIN_POST_CHARS=${n} should be between 5 and 60`);
+});
+
+test("content.js uses MIN_POST_CHARS at every length check site", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // No leftover hardcoded "length < 40" / "length < 50" length floors in
+  // the sweep / enqueue paths — those should all go through the constant.
+  const matches = content.match(/(rawText|txt)\.length\s*<\s*\d+/g) || [];
+  for (const m of matches) {
+    assert.ok(m.includes("MIN_POST_CHARS"),
+      `found hardcoded length check "${m}" — should use MIN_POST_CHARS`);
+  }
+});
+
+test("buildPrompt adds short-post guidance for posts under 80 chars", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  // The function definition should reference text.length and a "LENGTH NOTE"
+  // section so the model treats short text differently. White-box test.
+  assert.ok(bg.includes("LENGTH NOTE"),
+    "buildPrompt should include a LENGTH NOTE block");
+  assert.ok(/charCount\s*<\s*80/.test(bg) || /length\s*<\s*80/.test(bg),
+    "buildPrompt should branch on character count for short posts");
+});
+
+test("short-post prompt instructs default-to-authentic", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  // The short-post guidance should explicitly tell the model to default
+  // to authentic (0) when signal is thin — not slop.
+  assert.ok(/Default to authentic|default to authentic/.test(bg),
+    "short-post guidance should explicitly default to authentic");
+});
+
 
 (async () => {
   // give async tests time (they're awaited individually, but safety margin)
