@@ -31,6 +31,9 @@ let settings = {
   darkMode: false, showTrashCan: true,
   minConfidence: 60, universalMode: true, hideSlop: false,
   excludedSites: [], // user-added extra exclusions
+  showTrainingButtons: true, // show "Confirm slop" / "Not slop" training buttons
+  nonIntrusiveMode: false,    // hide slop quietly — no banners, no training UI
+  removeEntirely: false,      // when hiding, remove the element from the DOM completely
 };
 let isPaused = false;
 
@@ -359,6 +362,31 @@ slopStyle.textContent = `
   }
   .slop_radar_btn:hover { background: rgba(255,255,255,0.28) !important; }
 
+  /* Confirm-slop training button — slightly greener accent so it reads as
+     a positive/confirming action distinct from "Show anyway". */
+  .slop_radar_btn.sr_confirm_btn {
+    background: rgba(255,255,255,0.22) !important;
+  }
+  .slop_radar_btn.sr_confirmed {
+    background: rgba(120,220,140,0.32) !important;
+    border-color: rgba(160,240,180,0.55) !important;
+    cursor: default !important;
+  }
+
+  /* Figure-1 fix: when a slop card is revealed via "Show anyway", the
+     absolutely-positioned banner would otherwise overlap the first line of
+     the post. Pad the top of the revealed card by the banner height so the
+     content drops down clear of the controls. The --sr-banner-h variable is
+     set per-card in JS from the measured banner height. */
+  .slop_radar_card[data-sr-revealed] {
+    padding-top: var(--sr-banner-h, 44px) !important;
+  }
+  /* Twitter cards: the banner overlays the top, so revealed tweets also
+     need the same nudge. */
+  .slop_radar_twitter[data-sr-revealed] {
+    padding-top: var(--sr-banner-h, 44px) !important;
+  }
+
   /* LinkedIn/universal collapse */
   .slop_radar_linkedin[data-slop-detected="true"]:not([data-sr-revealed]):not(.sr_hide_mode),
   .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]):not(.sr_hide_mode) {
@@ -463,28 +491,25 @@ function isInsideModal(el) {
 function getLinkedInWrapper(textNode) {
   if (isInsideModal(textNode)) return null;
 
-  // Reject anything that isn't in the main feed scroll region — this keeps
-  // us out of the nav, the left/right rails, and the messaging overlay.
-  // NOTE: closest() cannot cross a shadow boundary, so if the post is
-  // rendered inside a shadow root the feed-root container (which lives in
-  // the light DOM) is unreachable. In that case we skip the feed-root gate
-  // and rely on the modal/comment rejection plus the wrapper walk instead.
-  const feedRoot = textNode.closest(
-    '[data-finite-scroll-hotspot], .scaffold-finite-scroll, ' +
-    '.scaffold-layout__main, main'
-  );
-  if (!feedRoot && !isInShadow(textNode)) return null;
-
-  // Reject comment text — comments sit inside .comments-comment-* containers
-  // and we only want top-level posts.
+  // Reject comment text — comments live in comment-specific containers.
   if (textNode.closest('.comments-comment-item, .comments-comments-list, ' +
       '[class*="comment-item"], [class*="comments-"]')) {
     return null;
   }
 
+  // ── Primary: the post card ──────────────────────────────────────────────
+  // LinkedIn's current feed wraps each post in [role="listitem"]. The post
+  // body (data-testid="expandable-text-box") sits ~15 levels inside it.
+  // This is the most reliable handle on the new feed DOM.
+  const listitem = textNode.closest('[role="listitem"]');
+  if (listitem && !isInsideModal(listitem)) {
+    return listitem;
+  }
+
+  // ── Fallback: legacy card selectors (older / un-migrated surfaces) ──────
   const cardSelectors = [
-    '[data-urn]','[data-activity-urn]','[data-id]',
-    '.feed-shared-update-v2','.occludable-update','.nt-card','article',
+    '[data-urn]', '[data-activity-urn]', '[data-id]',
+    '.feed-shared-update-v2', '.occludable-update', '.nt-card', 'article',
   ];
   for (const sel of cardSelectors) {
     const found = textNode.closest(sel);
@@ -494,19 +519,22 @@ function getLinkedInWrapper(textNode) {
       return found;
     }
   }
+
+  // ── Last resort: walk up looking for a card-like ancestor ──────────────
   const INNER = ['__description','__text','__content','segment-list','inline-show'];
   let el = textNode.parentElement, best = null, depth = 0;
-  while (el && el.tagName !== 'BODY' && el.tagName !== 'MAIN' && depth < 20) {
+  while (el && el.tagName !== 'BODY' && el.tagName !== 'MAIN' && depth < 25) {
     if (el.matches?.(LINKEDIN_MODAL_SEL)) return null;
+    if (el.getAttribute && el.getAttribute('role') === 'listitem') { best = el; break; }
     const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
     const hasUrn = el.hasAttribute('data-urn') || el.hasAttribute('data-activity-urn') || el.hasAttribute('data-id');
     const isInner = INNER.some(c => cls.includes(c));
-    if (!isInner && (hasUrn || cls.includes('occludable') || cls.includes('feed-shared-update-v2') || cls.includes('nt-card') || el.tagName === 'ARTICLE' || el.tagName === 'LI')) best = el;
+    if (!isInner && (hasUrn || cls.includes('occludable') || cls.includes('feed-shared-update-v2') || cls.includes('nt-card') || el.tagName === 'ARTICLE')) best = el;
     el = el.parentElement; depth++;
   }
   if (!best) {
     let fb = textNode.parentElement;
-    for (let i = 0; i < 8 && fb && fb.tagName !== 'BODY'; i++) fb = fb.parentElement;
+    for (let i = 0; i < 10 && fb && fb.tagName !== 'BODY'; i++) fb = fb.parentElement;
     best = fb;
   }
   if (!best || isInsideModal(best)) return null;
@@ -582,6 +610,30 @@ function uncategorizeSlop(wrapper, postText, btn) {
   });
 }
 
+// Confirm a slop verdict was correct — reinforces the model. Mirrors the
+// "not slop" flow but in the positive direction: the post is run through
+// the local model (teachMissedPost) to extract confirming patterns into the
+// modular userTaughtPatterns bucket, so similar posts get caught next time.
+function confirmSlop(wrapper, postText, btn) {
+  btn.textContent = "⏳"; btn.disabled = true;
+  chrome.runtime.sendMessage({ action: "teachMissedPost", postText }, (res) => {
+    if (chrome.runtime.lastError || !res) {
+      btn.textContent = "✗ retry"; btn.disabled = false;
+      srLog("confirm slop: background did not respond");
+      return;
+    }
+    btn.textContent = "✓ Learned";
+    btn.classList.add("sr_confirmed");
+    // keep it disabled — it's been confirmed, no need to click again
+    if (res.ok && res.patterns && res.patterns.length > 0) {
+      srLog(`confirm slop: reinforced with ${res.patterns.length} pattern(s): ` +
+        res.patterns.join(" | "));
+    } else {
+      srLog(`confirm slop: ${res.note || "already well covered"}`);
+    }
+  });
+}
+
 // ── Site pause banner ─────────────────────────────────────────────────────
 function showSitePauseBanner() {
   if (document.getElementById("sr_site_pause_banner")) return;
@@ -614,6 +666,18 @@ function applySlop(wrapper, confidence, fromCache = false) {
   const postText = wrapper.textContent?.trim().substring(0, 800) || "";
   cacheSetVerdict(postText, true, confidence);
 
+  if (!fromCache) recordResult(true);
+
+  // ── Mode 1: remove entirely — take the element off the page, no UI ──────
+  if (settings.removeEntirely) {
+    // Keep a tiny stamped placeholder comment so recycle detection and
+    // the cache still behave, but the visible element is gone.
+    wrapper.setAttribute("data-slop-detected", "true");
+    wrapper.dataset.srStampedText = postText.substring(0, 120);
+    wrapper.style.setProperty("display", "none", "important");
+    return;
+  }
+
   wrapper.classList.add("slop_radar_card", `slop_radar_${PLATFORM}`);
   wrapper.setAttribute("data-slop-detected", "true");
   wrapper.removeAttribute("data-sr-revealed");
@@ -621,6 +685,14 @@ function applySlop(wrapper, confidence, fromCache = false) {
 
   if (window.getComputedStyle(wrapper).position === "static") {
     wrapper.style.setProperty("position", "relative", "important");
+  }
+
+  // ── Mode 2: non-intrusive — hide the slop quietly, add nothing else ─────
+  // No banner, no training buttons. Just collapse the card out of view.
+  // For people who have trained the filter and now just want clean feeds.
+  if (settings.nonIntrusiveMode) {
+    wrapper.classList.add("sr_hide_mode", "sr_noninstrusive");
+    return;
   }
 
   // hideSlop mode: just add class and banner, hide everything else
@@ -631,7 +703,7 @@ function applySlop(wrapper, confidence, fromCache = false) {
     wrapper.style.setProperty("overflow", "hidden", "important");
   }
 
-  // Banner
+  // ── Mode 3: normal — banner with controls ──────────────────────────────
   const banner = document.createElement("div");
   banner.className = "slop_dog_ear";
 
@@ -666,19 +738,42 @@ function applySlop(wrapper, confidence, fromCache = false) {
   });
   controls.appendChild(showBtn);
 
-  // "Not slop" correction button
-  const notSlopBtn = document.createElement("button");
-  notSlopBtn.className = "slop_radar_btn";
-  notSlopBtn.textContent = "✓ Not slop";
-  notSlopBtn.title = "Incorrectly flagged? Teach SlopRadar";
-  notSlopBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    uncategorizeSlop(wrapper, postText, notSlopBtn);
-  });
-  controls.appendChild(notSlopBtn);
+  // Training buttons — can be hidden once the filter is well-trained.
+  if (settings.showTrainingButtons) {
+    // "Confirm slop" — reinforces: runs the post through the model to
+    // extract confirming patterns into the modular userTaughtPatterns bucket.
+    const confirmBtn = document.createElement("button");
+    confirmBtn.className = "slop_radar_btn sr_confirm_btn";
+    confirmBtn.textContent = "✓ Confirm slop";
+    confirmBtn.title = "Correctly flagged — teach SlopRadar to catch more like this";
+    confirmBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      confirmSlop(wrapper, postText, confirmBtn);
+    });
+    controls.appendChild(confirmBtn);
+
+    // "Not slop" — the inverse correction (narrows over-broad patterns).
+    const notSlopBtn = document.createElement("button");
+    notSlopBtn.className = "slop_radar_btn";
+    notSlopBtn.textContent = "✕ Not slop";
+    notSlopBtn.title = "Incorrectly flagged? Teach SlopRadar";
+    notSlopBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      uncategorizeSlop(wrapper, postText, notSlopBtn);
+    });
+    controls.appendChild(notSlopBtn);
+  }
 
   banner.append(ribbon, controls);
   wrapper.insertBefore(banner, wrapper.firstChild);
+
+  // Measure the banner and expose its height as a CSS variable so the
+  // "revealed" padding-top matches exactly — gives the controls room to
+  // breathe instead of overlapping the first line of the post.
+  requestAnimationFrame(() => {
+    const h = banner.offsetHeight || 44;
+    wrapper.style.setProperty("--sr-banner-h", h + "px");
+  });
 
   // Blur cover (non-hide mode only)
   if (!settings.hideSlop) {
@@ -689,8 +784,6 @@ function applySlop(wrapper, confidence, fromCache = false) {
       blurCover.style.top = (banner.offsetHeight || 40) + "px";
     });
   }
-
-  if (!fromCache) recordResult(true);
 }
 
 // ── Apply NOT SLOP ────────────────────────────────────────────────────────
@@ -702,6 +795,13 @@ function applyNotSlop(wrapper, confidence, force = false, fromCache = false) {
   const postText = wrapper.textContent?.trim().substring(0, 800) || "";
   cacheSetVerdict(postText, false, confidence);
   wrapper.dataset.srStampedText = postText.substring(0, 120);
+
+  // In non-intrusive / remove-entirely modes the NOT SLOP tag is just
+  // visual noise — the whole point of those modes is to add nothing to the
+  // page. We still record the verdict + cache it above, just no green tag.
+  if (settings.nonIntrusiveMode || settings.removeEntirely) {
+    return;
+  }
 
   wrapper.classList.add("slop_radar_card", `slop_radar_${PLATFORM}`);
   if (window.getComputedStyle(wrapper).position === "static") {
@@ -760,18 +860,17 @@ function applyNotSlop(wrapper, confidence, force = false, fromCache = false) {
 function getTextSelectors() {
   if (IS_TWITTER) return '[data-testid="tweetText"]';
   if (IS_LINKEDIN) {
-    // LinkedIn rotates obfuscated CSS class names, so class-based selectors
-    // break silently. We target structure instead: post body text on
-    // LinkedIn is always inside `<span dir="ltr">` (a stable accessibility
-    // attribute). We cast wide and let getLinkedInWrapper + the 40-char
-    // minimum filter out nav/labels/buttons.
+    // LinkedIn's current feed marks every post body with the stable test ID
+    // data-testid="expandable-text-box" — the same kind of stable hook X
+    // uses for tweetText. This survives their CSS-class obfuscation.
+    // The older class-based selectors are kept as fallbacks for any
+    // un-migrated surfaces, plus a [dir="ltr"] catch-all.
     return [
-      'span[dir="ltr"]',
-      // Keep the class-based ones too — when they DO match they give a
-      // cleaner text node, and they cost nothing when they don't.
+      '[data-testid="expandable-text-box"]',
       '.update-components-text',
       '.feed-shared-update-v2__description-wrapper',
       '.feed-shared-inline-show-more-text',
+      'span[dir="ltr"]',
     ].join(',');
   }
   return 'p, [class*="post"] p, [class*="content"] p, article p';
@@ -844,6 +943,16 @@ async function drainOne() {
 
       // Healthy response — reset the streak.
       swFailureStreak = 0;
+
+      // A stale response means the background dropped this item because the
+      // tab navigated/reloaded after it was enqueued. Don't stamp anything —
+      // just move on. (On a hard reload this content script is already gone;
+      // this guard matters for SPA navigation within the same document.)
+      if (response.stale) {
+        requestAnimationFrame(drainOne);
+        return;
+      }
+
       const confidence = response.confidence ?? 50;
       if (response.isSlop) applySlop(wrapper, confidence);
       else applyNotSlop(wrapper, confidence);
@@ -884,6 +993,28 @@ function enqueueNode(textNode) {
     if (stampedText && stampedText !== rawText.substring(0, 120)) {
       resetWrapper(wrapper);
     } else {
+      // Same wrapper, same text — but LinkedIn (and X) re-render the card's
+      // inner content as you scroll/navigate, which silently destroys the
+      // banner / blur / NOT-SLOP tag we injected while leaving the wrapper
+      // element itself in evaluatedWrappers. Our state says "done" but the
+      // DOM is blank. Detect that and re-apply from the cached verdict.
+      const verdict = cacheGetVerdict(rawText);
+      if (verdict) {
+        const blockMissing = verdict.isSlop
+          ? !wrapper.querySelector(".slop_dog_ear") &&
+            !wrapper.classList.contains("sr_hide_mode") &&
+            wrapper.style.display !== "none"
+          : false; // NOT-SLOP tag missing is cosmetic — don't churn on it
+        if (blockMissing) {
+          // Re-stamp: clear evaluated state and re-apply the known verdict.
+          evaluatedWrappers.delete(wrapper);
+          resetWrapper(wrapper);
+          if (verdict.isSlop) applySlop(wrapper, verdict.confidence, true);
+          else applyNotSlop(wrapper, verdict.confidence, true, true);
+          srLog(`re-applied ${verdict.isSlop ? "SLOP" : "ok"} block — ` +
+            `LinkedIn had wiped it`);
+        }
+      }
       return;
     }
   }

@@ -140,9 +140,12 @@ function loadSettings() {
     currentSettings = s;
     document.getElementById("s-dark-mode").checked = !!s.darkMode;
     document.getElementById("s-trash-can").checked = s.showTrashCan !== false;
-      document.getElementById("s-universal-mode").checked = s.universalMode !== false;
-  document.getElementById("s-hide-slop").checked = !!s.hideSlop;
-  document.getElementById("s-min-conf").value = s.minConfidence ?? 60;
+    document.getElementById("s-universal-mode").checked = s.universalMode !== false;
+    document.getElementById("s-hide-slop").checked = !!s.hideSlop;
+    document.getElementById("s-remove-entirely").checked = !!s.removeEntirely;
+    document.getElementById("s-noninstrusive").checked = !!s.nonIntrusiveMode;
+    document.getElementById("s-training-buttons").checked = s.showTrainingButtons !== false;
+    document.getElementById("s-min-conf").value = s.minConfidence ?? 60;
     document.getElementById("s-min-conf-val").textContent = `${s.minConfidence ?? 60}%`;
     applyDark(!!s.darkMode);
   });
@@ -156,16 +159,32 @@ document.getElementById("s-min-conf").addEventListener("input", (e) => {
   document.getElementById("s-min-conf-val").textContent = `${e.target.value}%`;
 });
 
+// "Remove entirely" and "Hide slop" and "Non-intrusive" overlap conceptually;
+// keep the UI honest by making them behave as a sensible group.
+document.getElementById("s-remove-entirely").addEventListener("change", (e) => {
+  if (e.target.checked) document.getElementById("s-hide-slop").checked = true;
+});
+document.getElementById("s-noninstrusive").addEventListener("change", (e) => {
+  // Non-intrusive implies no training buttons.
+  if (e.target.checked) document.getElementById("s-training-buttons").checked = false;
+});
+
 document.getElementById("save-settings-btn").addEventListener("click", () => {
   const settings = {
+    // preserve fields not exposed as toggles here (e.g. excludedSites)
+    ...currentSettings,
     darkMode: document.getElementById("s-dark-mode").checked,
     showTrashCan: document.getElementById("s-trash-can").checked,
     universalMode: document.getElementById("s-universal-mode").checked,
     hideSlop: document.getElementById("s-hide-slop").checked,
+    removeEntirely: document.getElementById("s-remove-entirely").checked,
+    nonIntrusiveMode: document.getElementById("s-noninstrusive").checked,
+    showTrainingButtons: document.getElementById("s-training-buttons").checked,
     minConfidence: parseInt(document.getElementById("s-min-conf").value, 10),
   };
   chrome.runtime.sendMessage({ action: "saveSettings", settings }, () => {
     toast("✓ Settings saved");
+    currentSettings = settings;
     // Notify all content scripts settings changed
     chrome.tabs.query({}, (tabs) => {
       tabs.forEach(tab => {

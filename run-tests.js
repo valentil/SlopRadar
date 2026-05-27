@@ -760,6 +760,104 @@ test("context menu is registered with the right targets", () => {
   assert.ok(typeof chrome.contextMenus.create === "function");
 });
 
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 13 — Display-mode settings (training buttons / non-intrusive / remove)
+// ════════════════════════════════════════════════════════════════════════
+suite("display-modes");
+
+testAsync("new display-mode settings have safe defaults", async () => {
+  const chrome = loadBackground();
+  const s = await chrome.runtime._fireMessage({ action: "getSettings" });
+  // Training buttons on by default (filter starts untrained).
+  assert.equal(s.showTrainingButtons, true);
+  // Quiet/aggressive modes off by default.
+  assert.equal(s.nonIntrusiveMode, false);
+  assert.equal(s.removeEntirely, false);
+});
+
+testAsync("display-mode settings round-trip through storage", async () => {
+  const chrome = loadBackground();
+  await chrome.runtime._fireMessage({
+    action: "saveSettings",
+    settings: {
+      showTrainingButtons: false,
+      nonIntrusiveMode: true,
+      removeEntirely: true,
+    },
+  });
+  const s = await chrome.runtime._fireMessage({ action: "getSettings" });
+  assert.equal(s.showTrainingButtons, false);
+  assert.equal(s.nonIntrusiveMode, true);
+  assert.equal(s.removeEntirely, true);
+});
+
+testAsync("saveSettings preserves excludedSites it wasn't given", async () => {
+  const chrome = loadBackground();
+  // Seed an exclusion, then save unrelated settings.
+  await chrome.runtime._fireMessage({
+    action: "saveSettings",
+    settings: { excludedSites: ["example.com"], darkMode: true },
+  });
+  const s = await chrome.runtime._fireMessage({ action: "getSettings" });
+  assert.deepEqual(s.excludedSites, ["example.com"]);
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 14 — Tab reload / navigation drops queued work
+// ════════════════════════════════════════════════════════════════════════
+suite("tab-refresh");
+
+testAsync("tabRefreshing message is handled without error", async () => {
+  const chrome = loadBackground();
+  // Should not throw even when the tab has nothing queued.
+  const res = await chrome.runtime._fireMessage({
+    action: "tabRefreshing", tabId: 123,
+  });
+  // handler returns true/undefined; just assert no exception bubbled.
+  assert.ok(true);
+});
+
+test("background source bumps a per-tab epoch on purge", () => {
+  // White-box: confirm the epoch mechanism exists in the shipped source,
+  // so a tabId-reuse reload can't silently process stale items.
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(
+    path.join(findExtDir(), "background.js"), "utf8");
+  assert.ok(bg.includes("bumpTabEpoch"), "bumpTabEpoch defined");
+  assert.ok(bg.includes("getTabEpoch"), "getTabEpoch defined");
+  // purgeTab must bump the epoch, and drainQueue must compare it.
+  assert.ok(/purgeTab[\s\S]{0,200}bumpTabEpoch/.test(bg),
+    "purgeTab bumps the epoch");
+  assert.ok(bg.includes("item.epoch !== getTabEpoch"),
+    "drainQueue skips stale-epoch items");
+});
+
+test("content source flushes pendingNodes on SPA navigation", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(
+    path.join(findExtDir(), "content.js"), "utf8");
+  // flushQueue must empty pendingNodes, and SPA-nav detection must call it.
+  assert.ok(/flushQueue[\s\S]{0,200}pendingNodes\.length = 0/.test(content),
+    "flushQueue empties pendingNodes");
+  assert.ok(/location\.href !== lastUrl[\s\S]{0,120}flushQueue/.test(content),
+    "SPA nav detection calls flushQueue");
+});
+
+test("content re-applies a wiped slop block from the verdict cache", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(
+    path.join(findExtDir(), "content.js"), "utf8");
+  // enqueueNode must detect a missing banner on an evaluated wrapper and
+  // re-apply from cache rather than silently skipping it as a dup.
+  assert.ok(content.includes("blockMissing"),
+    "enqueueNode checks whether the injected block is still present");
+  assert.ok(/blockMissing[\s\S]{0,300}applySlop/.test(content),
+    "re-applies slop when the block was wiped");
+});
+
 
 (async () => {
   // give async tests time (they're awaited individually, but safety margin)

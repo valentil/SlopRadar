@@ -58,6 +58,9 @@ const DEFAULT_SETTINGS = {
   universalMode: true,
   hideSlop: false, // hide slop cards entirely instead of blur/collapse
   excludedSites: [], // extra user-added hostnames to skip in universal mode
+  showTrainingButtons: true, // show Confirm/Not-slop buttons on slop cards
+  nonIntrusiveMode: false,   // quiet mode — hide slop, no banners or buttons
+  removeEntirely: false,     // remove slop elements from the DOM completely
 };
 
 // ── Storage helpers ───────────────────────────────────────────────────────
@@ -376,6 +379,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   purgeTab(tabId, "closed");
   if (tabId === activeTabId) activeTabId = null;
   visibleTabIds.delete(tabId);
+  tabEpochs.delete(tabId);
   setBadgeIdle(tabId);
 });
 
@@ -387,6 +391,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 function purgeTab(tabId, reason) {
+  // Bump the epoch first — anything still in flight for this tab is now
+  // stale and will be skipped by drainQueue even if it was already shifted.
+  bumpTabEpoch(tabId);
   const before = queue.length;
   queue = queue.filter(item => item.tabId !== tabId);
   const purged = before - queue.length;
@@ -400,6 +407,18 @@ function purgeTab(tabId, reason) {
 let queue = [];
 let draining = false;
 
+// Per-tab epoch. Every time a tab navigates or reloads we bump its epoch.
+// Queued items capture the epoch they were enqueued under; on drain we skip
+// any item whose epoch is stale — so a reload reliably drops in-flight work
+// for that tab even though the tabId stays the same.
+const tabEpochs = new Map();
+function getTabEpoch(tabId) {
+  return tabEpochs.get(tabId) || 0;
+}
+function bumpTabEpoch(tabId) {
+  tabEpochs.set(tabId, getTabEpoch(tabId) + 1);
+}
+
 function sortQueue() {
   queue.sort((a, b) => {
     const pa = tabPriority(a.tabId);
@@ -410,7 +429,11 @@ function sortQueue() {
 }
 
 function enqueue(tabId, text, sendResponse) {
-  queue.push({ tabId, text, sendResponse, enqueuedAt: Date.now() });
+  queue.push({
+    tabId, text, sendResponse,
+    enqueuedAt: Date.now(),
+    epoch: getTabEpoch(tabId),
+  });
   sortQueue();
   broadcastQueueSize();
   drainQueue();
@@ -438,6 +461,16 @@ async function drainQueue() {
     let tabStillOpen = false;
     try { await chrome.tabs.get(item.tabId); tabStillOpen = true; } catch (_) {}
     if (!tabStillOpen) { console.log(`[SlopRadar] Skip gone tab ${item.tabId}`); continue; }
+
+    // Skip items enqueued before the tab navigated/reloaded. The tabId is
+    // unchanged on reload, so the open-tab check above passes — the epoch
+    // is what actually tells us this work belongs to a now-dead page.
+    if (item.epoch !== getTabEpoch(item.tabId)) {
+      console.log(`[SlopRadar] Skip stale item for tab ${item.tabId} ` +
+        `(epoch ${item.epoch} != ${getTabEpoch(item.tabId)})`);
+      try { item.sendResponse({ isSlop: false, confidence: 0, stale: true }); } catch (_) {}
+      continue;
+    }
 
     const settings = await getSettings();
     const patterns = await getPatterns();

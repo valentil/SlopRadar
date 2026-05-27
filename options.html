@@ -135,6 +135,19 @@
 
   /* Settings rows */
   .setting-group { margin-bottom: 20px; }
+
+  /* Sticky save bar — pinned to the bottom of the settings panel so the
+     user never has to scroll to find "Save settings". */
+  #panel-settings { padding-bottom: 64px; }
+  .settings-save-bar {
+    position: sticky; bottom: 0; left: 0; right: 0;
+    margin: 0 -24px -20px; padding: 12px 24px;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    display: flex; justify-content: flex-end;
+    z-index: 50;
+  }
+  .settings-save-bar .btn { min-width: 140px; }
   .setting-group-title {
     font-size: 0.65rem; font-weight: 800; letter-spacing: 0.1rem;
     text-transform: uppercase; color: var(--text2);
@@ -265,16 +278,33 @@
 </div>
 
 <div class="tabs">
-  <button class="tab-btn active" data-tab="stats">Stats</button>
+  <button class="tab-btn active" data-tab="stats">Status</button>
   <button class="tab-btn" data-tab="settings">Settings</button>
   <button class="tab-btn" data-tab="patterns">Patterns</button>
   <button class="tab-btn" data-tab="logs">Logs</button>
   <button class="tab-btn" data-tab="about">About</button>
 </div>
 
-<!-- STATS -->
+<!-- STATUS -->
 <div class="panel active" id="panel-stats">
-  <div class="section-header" style="margin-top:16px">
+
+  <!-- Site pause — moved here so it's the first thing on the Status page -->
+  <div class="setting-group" style="margin-top:16px;margin-bottom:18px">
+    <div class="setting-group-title">Site pause</div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label" id="s-site-pause-label">Pause on current site</div>
+        <div class="setting-desc" id="s-site-pause-desc">Stop processing posts on this site</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-shrink:0">
+        <button class="btn" id="s-pause-session-btn">Today</button>
+        <button class="btn danger" id="s-pause-forever-btn">Forever</button>
+      </div>
+    </div>
+    <div id="s-paused-sites-list" style="margin-top:8px"></div>
+  </div>
+
+  <div class="section-header">
     <h2>Performance</h2>
     <span class="queue-pill" id="queue-pill">
       <span class="qdot"></span>
@@ -357,10 +387,30 @@
     <div class="setting-row">
       <div>
         <div class="setting-label">Hide slop entirely</div>
-        <div class="setting-desc">Remove slop cards completely instead of blurring/collapsing them</div>
+        <div class="setting-desc">Collapse slop cards down to just the banner instead of blurring them</div>
       </div>
       <label class="toggle">
         <input type="checkbox" id="s-hide-slop"/>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Remove slop entirely</div>
+        <div class="setting-desc">Take slop posts off the page completely — no banner, nothing left behind</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-remove-entirely"/>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Non-intrusive mode</div>
+        <div class="setting-desc">Quietly hide slop with no banners or training buttons — best once the filter is well-trained</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-noninstrusive"/>
         <span class="toggle-track"></span>
       </label>
     </div>
@@ -380,6 +430,16 @@
     <div class="setting-group-title">Card controls</div>
     <div class="setting-row">
       <div>
+        <div class="setting-label">Show training buttons</div>
+        <div class="setting-desc">Show “Confirm slop” / “Not slop” buttons on flagged posts to teach the model. Turn off once it’s trained well.</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-training-buttons"/>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Show "learn from this" trash can</div>
         <div class="setting-desc">Adds a 🗑️ button to NOT SLOP dog-ears to teach the model new patterns</div>
       </div>
@@ -388,21 +448,6 @@
         <span class="toggle-track"></span>
       </label>
     </div>
-  </div>
-
-  <div class="setting-group">
-    <div class="setting-group-title">Site pause</div>
-    <div class="setting-row">
-      <div>
-        <div class="setting-label" id="s-site-pause-label">Pause on current site</div>
-        <div class="setting-desc" id="s-site-pause-desc">Stop processing posts on this site</div>
-      </div>
-      <div style="display:flex;gap:6px;flex-shrink:0">
-        <button class="btn" id="s-pause-session-btn">This visit</button>
-        <button class="btn danger" id="s-pause-forever-btn">Forever</button>
-      </div>
-    </div>
-    <div id="s-paused-sites-list" style="margin-top:8px"></div>
   </div>
 
   <div class="setting-group">
@@ -421,7 +466,8 @@
     <div id="s-excluded-list" style="margin-top:8px"></div>
   </div>
 
-  <div style="margin-top:4px">
+  <!-- Sticky save bar — always visible, no scrolling needed to save -->
+  <div class="settings-save-bar">
     <button class="btn primary" id="save-settings-btn">Save settings</button>
   </div>
 </div>
