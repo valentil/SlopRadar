@@ -217,6 +217,40 @@ async function recoverEngine(reason) {
   return !!aiSession;
 }
 
+// ── Self-healing watchdog ─────────────────────────────────────────────────
+// In practice the model frequently gets stuck in an "initializing" limbo:
+// LanguageModel.availability() reports "available" but the LanguageModel.create()
+// promise never resolves (or resolved long ago into a broken session). The
+// fix that works reliably is: just try again. This watchdog notices when we
+// have queued work but no session, and re-kicks initEngine — which is the
+// trick the user observed manually fixes things.
+let lastWatchdogKick = 0;
+async function engineWatchdog() {
+  if (aiSession) return;                 // session is up — nothing to do
+  if (engineInitInFlight) return;        // init already running — let it finish
+  if (!queue || queue.length === 0) return; // no work waiting
+  const now = Date.now();
+  if (now - lastWatchdogKick < 3000) return; // don't hammer
+  lastWatchdogKick = now;
+
+  // Only auto-kick if the model is *supposed* to be available. If it's
+  // downloading, the right answer is to wait — not poke it.
+  try {
+    if (typeof LanguageModel !== "undefined" && typeof LanguageModel.availability === "function") {
+      const avail = await LanguageModel.availability();
+      if (avail === "unavailable" || avail === "downloadable" || avail === "downloading") return;
+    }
+  } catch (_) {}
+
+  console.log("[SlopRadar] Watchdog: queue has work but no session — kicking initEngine");
+  initEngine();
+}
+// Run the watchdog every couple of seconds. MV3 will let this fire as long as
+// the service worker is alive; if the worker has gone idle we don't care
+// because new posts will wake it via the message handlers anyway.
+// (setInterval is set up further down, after `queue` is declared, to avoid
+// any TDZ surprise.)
+
 chrome.runtime.onInstalled.addListener(initEngine);
 chrome.runtime.onStartup.addListener(initEngine);
 
@@ -505,6 +539,10 @@ function purgeTab(tabId, reason) {
 
 // ── Priority queue ────────────────────────────────────────────────────────
 let queue = [];
+
+// Now that `queue` is declared, set up the engine watchdog timer that
+// auto-recovers from the "model stuck initializing" limbo.
+setInterval(engineWatchdog, 2000);
 let draining = false;
 
 // Per-tab epoch. Every time a tab navigates or reloads we bump its epoch.
@@ -528,9 +566,9 @@ function sortQueue() {
   });
 }
 
-function enqueue(tabId, text, sendResponse) {
+function enqueue(tabId, text, sendResponse, platform) {
   queue.push({
-    tabId, text, sendResponse,
+    tabId, text, sendResponse, platform,
     enqueuedAt: Date.now(),
     epoch: getTabEpoch(tabId),
   });
@@ -576,7 +614,7 @@ async function drainQueue() {
     const patterns = await getPatterns();
 
     try {
-      const result = await aiSession.prompt(buildPrompt(item.text, patterns));
+      const result = await aiSession.prompt(buildPrompt(item.text, patterns, item.platform));
       const rawOutput = (result || "").trim();
 
       // Parse the verdict. Critically, we distinguish three outcomes:
@@ -656,37 +694,65 @@ async function drainQueue() {
 // ── Prompt builder ────────────────────────────────────────────────────────
 // Only slopPatterns go into the prompt. userTaughtPatterns are page-side
 // heuristics (text fingerprints for quick-matching), NOT prompt content.
-function buildPrompt(text, patterns) {
+function buildPrompt(text, patterns, platform) {
   const patternList = patterns.map(p => `- ${p}`).join("\n");
-  // Length-aware guidance: short posts (typically replies, casual chatter)
-  // lack the surface area for the rich-content authentic signals — "code,
-  // error messages, narrow falsifiable claims" — so applying those criteria
-  // strictly mis-classifies normal conversation as slop. Give the model an
-  // explicit tier for short text: default to authentic unless a pattern
-  // matches unambiguously.
   const charCount = text.length;
+
+  // ── Length-aware tier ──
+  // Short posts (replies, casual chatter) lack the surface area for our
+  // "rich content" authentic signals, so default to authentic unless a
+  // pattern matches unambiguously. Medium posts get moderate skepticism.
   let lengthGuidance = "";
   if (charCount < 80) {
     lengthGuidance = `
 
-LENGTH NOTE — this post is short (${charCount} chars). Short posts are usually replies or casual chatter and don't carry enough signal for confident slop detection. Default to authentic (0) UNLESS the text contains an unambiguous slop signature from the pattern list (e.g. obvious engagement bait, motivational platitudes, "nobody talks about this" framing). When in doubt on short text, classify 0 with moderate confidence. Do NOT mark short genuine reactions, questions, agreement, jokes, or short opinions as slop.`;
+LENGTH NOTE — this post is short (${charCount} chars). Short posts are usually replies or casual chatter and don't carry enough signal for confident slop detection. Default to authentic (0) UNLESS the text contains an unambiguous slop signature from the pattern list. Do NOT mark short genuine reactions, questions, agreement, jokes, or short opinions as slop.`;
   } else if (charCount < 200) {
     lengthGuidance = `
 
 LENGTH NOTE — this post is medium-length (${charCount} chars). Apply moderate skepticism: require a clear pattern match, not just one weak signal.`;
   }
-  return `You are an extremely cynical LinkedIn/Twitter slop detector. Classify as slop (1) or authentic (0).
+
+  // ── Platform-specific guidance ──
+  // LinkedIn is overwhelmingly thought-leadership templates — the heuristics
+  // there can be aggressive. X has more news, commentary, and quoted-tweet
+  // dynamics, so the patterns that matter are different: AI hype layered on
+  // a retweet, vague "this image/video" claims with no specifics, etc.
+  let platformGuidance = "";
+  if (platform === "linkedin") {
+    platformGuidance = `
+
+PLATFORM — LinkedIn. The dominant slop genre here is engagement-bait thought leadership: "here's the deep problem with X", "I'll say the quiet part out loud", "nobody talks about this but…", "the real reason X failed", motivational/career-advice posts with no specific claims, manufactured vulnerability ("I got rejected 47 times and here's what it taught me"). Classify these as slop with high confidence. Recruiters posting roles, people sharing genuine company news, technical content, or specific personal experiences with concrete details are NOT slop.`;
+  } else if (platform === "twitter") {
+    platformGuidance = `
+
+PLATFORM — X / Twitter. The slop dynamics here differ from LinkedIn:
+- A short post that quote-tweets or references another popular post AND wraps it in a broad AI/tech/society claim is usually slop ("this is the future", "everything has changed").
+- Posts referring to "this image", "this video", "watch this", "look at this" without describing the specific content, paired with a vague sweeping claim, are usually slop.
+- Threads opening with "🧵" or "a thread on…" followed by generic claims are often slop.
+- BUT: news commentary, political opinions, personal takes on current events, financial/policy analysis, sports reactions, jokes, and ordinary opinions are NOT slop just because they're confident. People posting about real events (ceasefires, elections, market moves, official statements) — including officials and reporters — are NOT slop, even with strong framing. Slop requires generic engagement-bait structure, not just confident opinion.`;
+  } else if (platform === "reddit" || platform === "threads") {
+    platformGuidance = `
+
+PLATFORM — ${platform}. Be conservative: this surface has more genuine discussion than LinkedIn. Require a clear engagement-bait or generic-AI-hype signal — confident opinions, news takes, or personal commentary are NOT slop on their own.`;
+  }
+
+  return `You are a careful detector of AI-generated marketing slop and engagement bait on social media. Classify as slop (1) or authentic (0).
 
 SLOP PATTERNS — classify as 1 if ANY of these are present:
 ${patternList}
 
-AUTHENTIC — classify as 0 ONLY if:
-- Contains actual code, specific error messages, or technical implementation detail
-- Describes a specific thing they personally built, measured, or tested with real numbers
-- Makes a narrow, falsifiable claim with evidence
-- Is a genuine question with no performance attached
-- Contains domain-specific jargon used correctly and precisely (not for show)
-- OR is a short reply / casual remark with no slop markers (see LENGTH NOTE below)${lengthGuidance}
+AUTHENTIC (0) — a post is authentic if ANY of these apply:
+- It reports on or discusses real-world news, events, policy, markets, sports, or politics — even with strong opinions or framing. Confident commentary about real events is not slop.
+- It contains specific details: code, error messages, real numbers, named entities, dates, or first-hand experience with concrete particulars.
+- It's a genuine question, joke, reaction, or short opinion without engagement-bait structure.
+- It makes a narrow, falsifiable claim with supporting evidence.
+
+DO NOT classify as slop just because:
+- The author writes confidently or with strong framing.
+- The post is about a current event or politically charged topic.
+- The author is a public figure, official, journalist, or pundit.
+- The post is short (see LENGTH NOTE).${platformGuidance}${lengthGuidance}
 
 Input Text:
 """
@@ -956,9 +1022,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "evaluatePost") {
-    if (!aiSession) { sendResponse({ isSlop: false, confidence: 50 }); return true; }
+    if (!aiSession) {
+      // Engine not ready — tell the content side to retry rather than
+      // stamping a fake confidence-50 verdict (the bug we fixed in the
+      // drain loop, repeated here). Kick init in case it never started.
+      initEngine();
+      sendResponse({ degraded: true });
+      return true;
+    }
     const tabId = request.tabId ?? sender.tab?.id ?? -1;
-    enqueue(tabId, request.text, sendResponse);
+    enqueue(tabId, request.text, sendResponse, request.platform);
     return true;
   }
 });

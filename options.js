@@ -247,27 +247,42 @@ function loadPatterns() {
 // ── Prompt inspector ──────────────────────────────────────────────────────
 // Mirrors buildPrompt() in background.js so the user can see exactly what the
 // model receives. Keep this in sync with background.js if the prompt changes.
-function buildPromptPreview(text, pats) {
+function buildPromptPreview(text, pats, platform) {
   const patternList = pats.map(p => `- ${p}`).join("\n");
   const charCount = text.length;
+
   let lengthGuidance = "";
   if (text && charCount < 80) {
-    lengthGuidance = `\n\nLENGTH NOTE — this post is short (${charCount} chars). Short posts are usually replies or casual chatter and don't carry enough signal for confident slop detection. Default to authentic (0) UNLESS the text contains an unambiguous slop signature from the pattern list. When in doubt on short text, classify 0 with moderate confidence.`;
+    lengthGuidance = `\n\nLENGTH NOTE — this post is short (${charCount} chars). Short posts are usually replies or casual chatter and don't carry enough signal for confident slop detection. Default to authentic (0) UNLESS the text contains an unambiguous slop signature from the pattern list. Do NOT mark short genuine reactions, questions, agreement, jokes, or short opinions as slop.`;
   } else if (text && charCount < 200) {
     lengthGuidance = `\n\nLENGTH NOTE — this post is medium-length (${charCount} chars). Apply moderate skepticism: require a clear pattern match, not just one weak signal.`;
   }
-  return `You are an extremely cynical LinkedIn/Twitter slop detector. Classify as slop (1) or authentic (0).
+
+  let platformGuidance = "";
+  if (platform === "linkedin") {
+    platformGuidance = `\n\nPLATFORM — LinkedIn. The dominant slop genre here is engagement-bait thought leadership: "here's the deep problem with X", "I'll say the quiet part out loud", "nobody talks about this but…", "the real reason X failed", motivational/career-advice posts with no specific claims, manufactured vulnerability ("I got rejected 47 times and here's what it taught me"). Classify these as slop with high confidence. Recruiters posting roles, people sharing genuine company news, technical content, or specific personal experiences with concrete details are NOT slop.`;
+  } else if (platform === "twitter") {
+    platformGuidance = `\n\nPLATFORM — X / Twitter. The slop dynamics here differ from LinkedIn:\n- A short post that quote-tweets or references another popular post AND wraps it in a broad AI/tech/society claim is usually slop ("this is the future", "everything has changed").\n- Posts referring to "this image", "this video", "watch this", "look at this" without describing the specific content, paired with a vague sweeping claim, are usually slop.\n- Threads opening with "🧵" or "a thread on…" followed by generic claims are often slop.\n- BUT: news commentary, political opinions, personal takes on current events, financial/policy analysis, sports reactions, jokes, and ordinary opinions are NOT slop just because they're confident. People posting about real events (ceasefires, elections, market moves, official statements) — including officials and reporters — are NOT slop, even with strong framing. Slop requires generic engagement-bait structure, not just confident opinion.`;
+  } else if (platform === "reddit" || platform === "threads") {
+    platformGuidance = `\n\nPLATFORM — ${platform}. Be conservative: this surface has more genuine discussion than LinkedIn. Require a clear engagement-bait or generic-AI-hype signal — confident opinions, news takes, or personal commentary are NOT slop on their own.`;
+  }
+
+  return `You are a careful detector of AI-generated marketing slop and engagement bait on social media. Classify as slop (1) or authentic (0).
 
 SLOP PATTERNS — classify as 1 if ANY of these are present:
 ${patternList}
 
-AUTHENTIC — classify as 0 ONLY if:
-- Contains actual code, specific error messages, or technical implementation detail
-- Describes a specific thing they personally built, measured, or tested with real numbers
-- Makes a narrow, falsifiable claim with evidence
-- Is a genuine question with no performance attached
-- Contains domain-specific jargon used correctly and precisely (not for show)
-- OR is a short reply / casual remark with no slop markers (see LENGTH NOTE below)${lengthGuidance}
+AUTHENTIC (0) — a post is authentic if ANY of these apply:
+- It reports on or discusses real-world news, events, policy, markets, sports, or politics — even with strong opinions or framing. Confident commentary about real events is not slop.
+- It contains specific details: code, error messages, real numbers, named entities, dates, or first-hand experience with concrete particulars.
+- It's a genuine question, joke, reaction, or short opinion without engagement-bait structure.
+- It makes a narrow, falsifiable claim with supporting evidence.
+
+DO NOT classify as slop just because:
+- The author writes confidently or with strong framing.
+- The post is about a current event or politically charged topic.
+- The author is a public figure, official, journalist, or pundit.
+- The post is short (see LENGTH NOTE).${platformGuidance}${lengthGuidance}
 
 Input Text:
 """
@@ -281,7 +296,8 @@ function renderPromptInspector() {
   const out = document.getElementById("prompt-inspect-out");
   if (!out) return;
   const testText = document.getElementById("prompt-test-input")?.value || "";
-  out.textContent = buildPromptPreview(testText, patterns);
+  const platform = document.getElementById("prompt-platform-sel")?.value || "linkedin";
+  out.textContent = buildPromptPreview(testText, patterns, platform);
 }
 
 (function wirePromptInspector() {
@@ -296,6 +312,8 @@ function renderPromptInspector() {
     if (!showing) renderPromptInspector();
   });
   if (input) input.addEventListener("input", renderPromptInspector);
+  const sel = document.getElementById("prompt-platform-sel");
+  if (sel) sel.addEventListener("change", renderPromptInspector);
 })();
 
 document.getElementById("add-pattern-btn").addEventListener("click", () => {
@@ -391,6 +409,11 @@ setInterval(loadStats, 3000); // refresh stats + page stats every 3s
 setInterval(loadEngineStatus, 5000); // refresh engine health
 
 // ── Local AI engine status + manual kickstart ─────────────────────────────
+// Track consecutive "not ready" status checks so the popup can auto-trigger
+// a kickstart when the model is stuck initializing. Once was enough manually,
+// according to user feedback — the trick is just trying again.
+let notReadyStreak = 0;
+let popupAutoKickAt = 0;
 function loadEngineStatus() {
   chrome.runtime.sendMessage({ action: "getEngineStatus" }, (res) => {
     if (chrome.runtime.lastError || !res) return;
@@ -402,22 +425,37 @@ function loadEngineStatus() {
       label.textContent = "Not available";
       label.style.color = "var(--text2)";
       desc.textContent = "This browser doesn't have the built-in Gemini Nano model.";
+      notReadyStreak = 0;
     } else if (res.availability === "downloadable" || res.availability === "downloading") {
       label.textContent = "Downloading model…";
       label.style.color = "var(--text2)";
       desc.textContent = "Gemini Nano is still downloading to your device. This is a one-time setup.";
+      notReadyStreak = 0; // legitimately waiting on download — don't auto-kick
     } else if (!res.ready) {
       label.textContent = "Starting…";
       label.style.color = "var(--text2)";
       desc.textContent = "The local model is initializing.";
+      notReadyStreak++;
+      // The model often gets stuck here; calling kickstart unblocks it.
+      // Only auto-kick if we've been stuck for several polls AND haven't
+      // auto-kicked recently — so we don't spam during a legitimate cold start.
+      const now = Date.now();
+      if (notReadyStreak >= 2 && now - popupAutoKickAt > 15000) {
+        popupAutoKickAt = now;
+        chrome.runtime.sendMessage({ action: "kickstartEngine" }, () => {
+          loadEngineStatus();
+        });
+      }
     } else if (res.recentFailures >= 2) {
       label.textContent = "⚠ Struggling";
       label.style.color = "var(--red, #e02424)";
       desc.textContent = `The model returned ${res.recentFailures} bad results recently. Try Restart if posts aren't being classified.`;
+      notReadyStreak = 0;
     } else {
       label.textContent = "✓ Ready";
       label.style.color = "var(--green, #137333)";
       desc.textContent = "Gemini Nano runs on your device — nothing leaves your browser.";
+      notReadyStreak = 0;
     }
   });
 }

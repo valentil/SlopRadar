@@ -318,10 +318,14 @@ testAsync("pause state round-trips", async () => {
   assert.equal(resp.paused, true);
 });
 
-testAsync("evaluatePost with no AI returns safe default", async () => {
+testAsync("evaluatePost with no AI returns degraded, not a fake verdict", async () => {
   const chrome = loadBackground();
   const resp = await chrome.runtime._fireMessage({ action: "evaluatePost", text: "some post", tabId: 1 });
-  assert.equal(resp.isSlop, false, "no AI = treat as not slop");
+  // Old code returned a fake {isSlop:false, confidence:50}, which was the
+  // "50% not slop for everything" bug. The fix: signal degraded so the
+  // content side re-queues instead of stamping.
+  assert.equal(resp.degraded, true, "no AI session = signal degraded for retry");
+  assert.equal(resp.isSlop, undefined, "must not fabricate a verdict");
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1040,9 +1044,11 @@ test("inspector prompt shares the key structural markers with background", () =>
   // Both must contain these exact anchor strings — if the prompt is reworded
   // in one place, this fails until the other is updated too.
   const markers = [
-    "extremely cynical LinkedIn/Twitter slop detector",
+    "careful detector of AI-generated marketing slop",
     "SLOP PATTERNS — classify as 1 if ANY of these are present:",
     "LENGTH NOTE",
+    "PLATFORM — LinkedIn",
+    "PLATFORM — X / Twitter",
     'Respond with ONLY a JSON object like {"slop": 1, "confidence": 87}',
   ];
   for (const m of markers) {
@@ -1130,7 +1136,128 @@ test("popup wires a manual kickstart button", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// SUITE 19 — Display modes (mutually exclusive + applied correctly)
+// SUITE 20 — Platform-aware prompts + news/factual carve-out
+// ════════════════════════════════════════════════════════════════════════
+// Catches the "treasury secretary post flagged as slop" class of bug:
+// confident commentary on real events must not be classified as slop just
+// because of strong framing. Different platforms also need different guidance.
+suite("platform-prompts");
+
+// Pull buildPrompt out of background and exercise it directly.
+function loadBuildPrompt() {
+  const fs = require("fs");
+  const path = require("path");
+  const src = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  const m = src.match(/function buildPrompt[\s\S]*?\n\}\n/);
+  assert.ok(m, "buildPrompt source extracted");
+  const f = new Function("text", "patterns", "platform",
+    m[0] + "\nreturn buildPrompt(text, patterns, platform);");
+  return f;
+}
+
+test("buildPrompt takes a platform argument and varies output", () => {
+  const bp = loadBuildPrompt();
+  const li = bp("hello world", ["test pattern"], "linkedin");
+  const tw = bp("hello world", ["test pattern"], "twitter");
+  assert.ok(li.includes("PLATFORM — LinkedIn"));
+  assert.ok(tw.includes("PLATFORM — X / Twitter"));
+  assert.notEqual(li, tw, "platform branches produce different prompts");
+});
+
+test("LinkedIn prompt names the thought-leadership patterns", () => {
+  const bp = loadBuildPrompt();
+  const out = bp("hello world", [], "linkedin");
+  assert.ok(out.includes("thought leadership"), "LI prompt explicitly calls out thought leadership");
+  assert.ok(/quiet part out loud|nobody talks about this|deep problem/i.test(out),
+    "LI prompt lists the specific LinkedIn engagement-bait phrasings");
+});
+
+test("X/Twitter prompt names retweet-with-broad-claim + this image/video patterns", () => {
+  const bp = loadBuildPrompt();
+  const out = bp("hello world", [], "twitter");
+  assert.ok(/quote.tweet|references another popular post/i.test(out),
+    "X prompt covers quote-tweet-plus-broad-claim slop");
+  assert.ok(/this image|this video|watch this/i.test(out),
+    "X prompt covers vague 'this image/video' slop");
+});
+
+test("prompt explicitly excludes news/political commentary from slop", () => {
+  const bp = loadBuildPrompt();
+  const out = bp("Treasury secretary announces extension of Iran ceasefire", [], "twitter");
+  // The carve-out must mention news/events AND the no-slop-just-because rules.
+  assert.ok(/news|current events|policy|politics|markets/i.test(out),
+    "AUTHENTIC criteria explicitly include news/events");
+  assert.ok(/public figure|official|journalist|pundit/i.test(out),
+    "AUTHENTIC criteria explicitly cover public figures/officials");
+  assert.ok(/DO NOT classify as slop just because/i.test(out),
+    "prompt has an explicit DO NOT list");
+});
+
+test("prompt no longer requires 'code or real numbers' to be authentic", () => {
+  const bp = loadBuildPrompt();
+  const out = bp("hello world", [], "twitter");
+  // The old AUTHENTIC-only-if criteria starting with code/errors was the
+  // root of the over-fitting — ordinary commentary couldn't qualify.
+  // The new criteria should be permissive (ANY of these apply).
+  assert.ok(!/AUTHENTIC — classify as 0 ONLY if[\s\S]{0,400}code, specific error/.test(out),
+    "the old narrow 'ONLY if code/errors/specific numbers' AUTHENTIC clause is gone");
+  assert.ok(/AUTHENTIC[^\n]*ANY of these/i.test(out),
+    "new criteria are permissive (ANY) not exclusive (ONLY)");
+});
+
+test("platform threads through enqueue and into the drain loop", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Content sends platform on every classify request.
+  assert.ok(/action:\s*"evaluatePost"[\s\S]{0,160}platform:\s*PLATFORM/.test(content),
+    "content includes platform in evaluatePost message");
+  // Background enqueue captures it and passes it to buildPrompt.
+  assert.ok(/enqueue\(tabId,\s*request\.text,\s*sendResponse,\s*request\.platform\)/.test(bg),
+    "evaluatePost handler forwards platform to enqueue");
+  assert.ok(/buildPrompt\(item\.text,\s*patterns,\s*item\.platform\)/.test(bg),
+    "drain loop passes item.platform to buildPrompt");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 21 — Engine watchdog (auto-recovers from stuck initializing)
+// ════════════════════════════════════════════════════════════════════════
+suite("engine-watchdog");
+
+test("background defines an engineWatchdog that calls initEngine", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  assert.ok(/async function engineWatchdog/.test(bg), "engineWatchdog defined");
+  assert.ok(/async function engineWatchdog[\s\S]{0,1200}initEngine\(\)/.test(bg),
+    "watchdog calls initEngine when conditions are met");
+  assert.ok(/setInterval\(engineWatchdog/.test(bg), "watchdog is scheduled");
+});
+
+test("watchdog skips kick when model is downloading", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  // Must check availability and return early on "downloading"/"downloadable".
+  assert.ok(/engineWatchdog[\s\S]{0,800}availability/.test(bg),
+    "watchdog consults LanguageModel.availability");
+  assert.ok(/downloadable[\s\S]{0,80}return/i.test(bg) ||
+            /downloading[\s\S]{0,80}return/i.test(bg),
+    "watchdog returns without kicking during a real download");
+});
+
+test("popup auto-kickstarts after a streak of not-ready statuses", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const opts = fs.readFileSync(path.join(findExtDir(), "options.js"), "utf8");
+  assert.ok(/notReadyStreak/.test(opts), "popup tracks not-ready streak");
+  assert.ok(/notReadyStreak\s*>=\s*2[\s\S]{0,200}kickstartEngine/.test(opts),
+    "popup auto-issues kickstart after streak threshold");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 22 — Display modes (mutually exclusive + applied correctly)
 // ════════════════════════════════════════════════════════════════════════
 suite("display-modes-v2");
 

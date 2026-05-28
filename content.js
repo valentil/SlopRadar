@@ -1070,7 +1070,7 @@ async function drainOne() {
   srLog(`Q:${pendingNodes.length} "${rawText.substring(0,60)}…"`);
 
   chrome.runtime.sendMessage(
-    { action: "evaluatePost", text: rawText.substring(0, 1500), tabId: MY_TAB_ID },
+    { action: "evaluatePost", text: rawText.substring(0, 1500), tabId: MY_TAB_ID, platform: PLATFORM },
     (response) => {
       // ── Service worker / model failure handling ────────────────────────
       // Two failure shapes, both must NOT be stamped:
