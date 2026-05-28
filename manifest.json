@@ -1,12 +1,11 @@
 {
   "manifest_version": 3,
   "name": "SlopRadar AI Filter",
-  "version": "1.4",
-  "description": "Uses local Gemini Nano to remove generic AI marketing posts from social feeds.",
+  "version": "1.5",
+  "description": "Uses on-device Gemini Nano to detect and hide generic AI-generated marketing slop in your social feeds. 100% local — nothing leaves your browser.",
   "permissions": [
     "scripting",
     "tabs",
-    "windows",
     "storage",
     "contextMenus"
   ],
@@ -14,16 +13,29 @@
     "*://*.linkedin.com/*",
     "*://*.x.com/*",
     "*://*.twitter.com/*",
-    "<all_urls>"
+    "*://*.reddit.com/*",
+    "*://*.threads.com/*",
+    "*://*.threads.net/*"
   ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "action": {
     "default_title": "SlopRadar",
-    "default_popup": "options.html"
+    "default_popup": "options.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "options_page": "options.html",
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
@@ -31,7 +43,9 @@
         "*://*.linkedin.com/*",
         "*://*.x.com/*",
         "*://*.twitter.com/*",
-        "<all_urls>"
+        "*://*.reddit.com/*",
+        "*://*.threads.com/*",
+        "*://*.threads.net/*"
       ],
       "js": [
         "content.js"

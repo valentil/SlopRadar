@@ -140,13 +140,12 @@ function loadSettings() {
     currentSettings = s;
     document.getElementById("s-dark-mode").checked = !!s.darkMode;
     document.getElementById("s-trash-can").checked = s.showTrashCan !== false;
-    document.getElementById("s-universal-mode").checked = s.universalMode !== false;
     document.getElementById("s-hide-slop").checked = !!s.hideSlop;
     document.getElementById("s-remove-entirely").checked = !!s.removeEntirely;
     document.getElementById("s-noninstrusive").checked = !!s.nonIntrusiveMode;
     document.getElementById("s-training-buttons").checked = s.showTrainingButtons !== false;
-    document.getElementById("s-min-conf").value = s.minConfidence ?? 60;
-    document.getElementById("s-min-conf-val").textContent = `${s.minConfidence ?? 60}%`;
+    document.getElementById("s-min-conf").value = s.minConfidence ?? 90;
+    document.getElementById("s-min-conf-val").textContent = `${s.minConfidence ?? 90}%`;
     applyDark(!!s.darkMode);
   });
 }
@@ -159,14 +158,23 @@ document.getElementById("s-min-conf").addEventListener("input", (e) => {
   document.getElementById("s-min-conf-val").textContent = `${e.target.value}%`;
 });
 
-// "Remove entirely" and "Hide slop" and "Non-intrusive" overlap conceptually;
-// keep the UI honest by making them behave as a sensible group.
-document.getElementById("s-remove-entirely").addEventListener("change", (e) => {
-  if (e.target.checked) document.getElementById("s-hide-slop").checked = true;
-});
-document.getElementById("s-noninstrusive").addEventListener("change", (e) => {
-  // Non-intrusive implies no training buttons.
-  if (e.target.checked) document.getElementById("s-training-buttons").checked = false;
+// "Hide slop entirely", "Remove slop entirely", and "Non-intrusive" are
+// three DISTINCT, mutually-exclusive display modes — not independent flags.
+// Turning one on turns the others off (radio-like), but each can also be
+// turned fully off to return to the default blur/banner treatment.
+const DISPLAY_MODE_IDS = ["s-hide-slop", "s-remove-entirely", "s-noninstrusive"];
+DISPLAY_MODE_IDS.forEach(id => {
+  document.getElementById(id).addEventListener("change", (e) => {
+    if (e.target.checked) {
+      // Uncheck the other display modes — only one can be active.
+      DISPLAY_MODE_IDS.filter(o => o !== id)
+        .forEach(o => { document.getElementById(o).checked = false; });
+      // Non-intrusive additionally hides training buttons (they'd be pointless).
+      if (id === "s-noninstrusive") {
+        document.getElementById("s-training-buttons").checked = false;
+      }
+    }
+  });
 });
 
 document.getElementById("save-settings-btn").addEventListener("click", () => {
@@ -175,7 +183,6 @@ document.getElementById("save-settings-btn").addEventListener("click", () => {
     ...currentSettings,
     darkMode: document.getElementById("s-dark-mode").checked,
     showTrashCan: document.getElementById("s-trash-can").checked,
-    universalMode: document.getElementById("s-universal-mode").checked,
     hideSlop: document.getElementById("s-hide-slop").checked,
     removeEntirely: document.getElementById("s-remove-entirely").checked,
     nonIntrusiveMode: document.getElementById("s-noninstrusive").checked,
@@ -233,8 +240,63 @@ function loadPatterns() {
     if (chrome.runtime.lastError || !res) return;
     patterns = res.patterns || [];
     renderPatterns();
+    renderPromptInspector();
   });
 }
+
+// ── Prompt inspector ──────────────────────────────────────────────────────
+// Mirrors buildPrompt() in background.js so the user can see exactly what the
+// model receives. Keep this in sync with background.js if the prompt changes.
+function buildPromptPreview(text, pats) {
+  const patternList = pats.map(p => `- ${p}`).join("\n");
+  const charCount = text.length;
+  let lengthGuidance = "";
+  if (text && charCount < 80) {
+    lengthGuidance = `\n\nLENGTH NOTE — this post is short (${charCount} chars). Short posts are usually replies or casual chatter and don't carry enough signal for confident slop detection. Default to authentic (0) UNLESS the text contains an unambiguous slop signature from the pattern list. When in doubt on short text, classify 0 with moderate confidence.`;
+  } else if (text && charCount < 200) {
+    lengthGuidance = `\n\nLENGTH NOTE — this post is medium-length (${charCount} chars). Apply moderate skepticism: require a clear pattern match, not just one weak signal.`;
+  }
+  return `You are an extremely cynical LinkedIn/Twitter slop detector. Classify as slop (1) or authentic (0).
+
+SLOP PATTERNS — classify as 1 if ANY of these are present:
+${patternList}
+
+AUTHENTIC — classify as 0 ONLY if:
+- Contains actual code, specific error messages, or technical implementation detail
+- Describes a specific thing they personally built, measured, or tested with real numbers
+- Makes a narrow, falsifiable claim with evidence
+- Is a genuine question with no performance attached
+- Contains domain-specific jargon used correctly and precisely (not for show)
+- OR is a short reply / casual remark with no slop markers (see LENGTH NOTE below)${lengthGuidance}
+
+Input Text:
+"""
+${text || "(paste a post above to preview)"}
+"""
+
+Respond with ONLY a JSON object like {"slop": 1, "confidence": 87}. No other text.`;
+}
+
+function renderPromptInspector() {
+  const out = document.getElementById("prompt-inspect-out");
+  if (!out) return;
+  const testText = document.getElementById("prompt-test-input")?.value || "";
+  out.textContent = buildPromptPreview(testText, patterns);
+}
+
+(function wirePromptInspector() {
+  const toggle = document.getElementById("prompt-inspect-toggle");
+  const body = document.getElementById("prompt-inspect-body");
+  const input = document.getElementById("prompt-test-input");
+  if (!toggle || !body) return;
+  toggle.addEventListener("click", () => {
+    const showing = body.style.display !== "none";
+    body.style.display = showing ? "none" : "block";
+    toggle.textContent = showing ? "Show" : "Hide";
+    if (!showing) renderPromptInspector();
+  });
+  if (input) input.addEventListener("input", renderPromptInspector);
+})();
 
 document.getElementById("add-pattern-btn").addEventListener("click", () => {
   const input = document.getElementById("new-pattern-input");
@@ -317,12 +379,70 @@ try {
   const v = chrome.runtime.getManifest()?.version;
   const verEl = document.getElementById("header-version");
   if (v && verEl) verEl.textContent = `AI feed filter — v${v}`;
+  const aboutEl = document.getElementById("about-version");
+  if (v && aboutEl) aboutEl.textContent = `v${v} — uses Gemini Nano on-device`;
 } catch (_) {}
 
 loadStats();
 loadSettings();
 loadPatterns();
+loadEngineStatus();
 setInterval(loadStats, 3000); // refresh stats + page stats every 3s
+setInterval(loadEngineStatus, 5000); // refresh engine health
+
+// ── Local AI engine status + manual kickstart ─────────────────────────────
+function loadEngineStatus() {
+  chrome.runtime.sendMessage({ action: "getEngineStatus" }, (res) => {
+    if (chrome.runtime.lastError || !res) return;
+    const label = document.getElementById("engine-status-label");
+    const desc = document.getElementById("engine-status-desc");
+    if (!label || !desc) return;
+
+    if (res.availability === "unsupported") {
+      label.textContent = "Not available";
+      label.style.color = "var(--text2)";
+      desc.textContent = "This browser doesn't have the built-in Gemini Nano model.";
+    } else if (res.availability === "downloadable" || res.availability === "downloading") {
+      label.textContent = "Downloading model…";
+      label.style.color = "var(--text2)";
+      desc.textContent = "Gemini Nano is still downloading to your device. This is a one-time setup.";
+    } else if (!res.ready) {
+      label.textContent = "Starting…";
+      label.style.color = "var(--text2)";
+      desc.textContent = "The local model is initializing.";
+    } else if (res.recentFailures >= 2) {
+      label.textContent = "⚠ Struggling";
+      label.style.color = "var(--red, #e02424)";
+      desc.textContent = `The model returned ${res.recentFailures} bad results recently. Try Restart if posts aren't being classified.`;
+    } else {
+      label.textContent = "✓ Ready";
+      label.style.color = "var(--green, #137333)";
+      desc.textContent = "Gemini Nano runs on your device — nothing leaves your browser.";
+    }
+  });
+}
+
+(function wireKickstart() {
+  const btn = document.getElementById("kickstart-btn");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "Restarting…";
+    chrome.runtime.sendMessage({ action: "kickstartEngine" }, (res) => {
+      btn.disabled = false;
+      if (chrome.runtime.lastError || !res?.ok) {
+        btn.textContent = "✗ Failed";
+        setTimeout(() => { btn.textContent = orig; }, 2500);
+        return;
+      }
+      btn.textContent = "✓ Restarted";
+      toast("Local AI engine restarted");
+      loadEngineStatus();
+      setTimeout(() => { btn.textContent = orig; }, 2500);
+    });
+  });
+})();
 
 // ── Site pause controls ───────────────────────────────────────────────────
 function loadPausedSites() {
@@ -455,7 +575,7 @@ document.querySelectorAll(".tab-btn").forEach(btn => {
   }
 });
 
-// ── Excluded sites (universal mode) ───────────────────────────────────────
+// ── Excluded sites (skip specific supported hosts) ────────────────────────
 function loadExcludedSites() {
   const list = document.getElementById("s-excluded-list");
   if (!list) return;

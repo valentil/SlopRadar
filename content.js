@@ -2,8 +2,20 @@
 
 const IS_TWITTER = location.hostname.includes("x.com") || location.hostname.includes("twitter.com");
 const IS_LINKEDIN = location.hostname.includes("linkedin.com");
+const IS_REDDIT = location.hostname.includes("reddit.com");
+const IS_THREADS = location.hostname.includes("threads.com") || location.hostname.includes("threads.net");
 const PAGE_HOSTNAME = location.hostname;
-const PLATFORM = IS_TWITTER ? "twitter" : IS_LINKEDIN ? "linkedin" : "universal";
+const PLATFORM = IS_TWITTER ? "twitter"
+  : IS_LINKEDIN ? "linkedin"
+  : IS_REDDIT ? "reddit"
+  : IS_THREADS ? "threads"
+  : "universal";
+
+// Sites with hand-tuned DOM adapters vs. those still relying on the generic
+// universal fallback. Beta sites work but detection is less precise — surfaced
+// in the settings UI so users know what to expect.
+const TUNED_PLATFORMS = ["twitter", "linkedin"];
+const IS_BETA_PLATFORM = !TUNED_PLATFORMS.includes(PLATFORM) && PLATFORM !== "universal";
 
 // Minimum post length to even consider for classification. Posts below this
 // floor are skipped entirely — they don't carry enough signal for the model
@@ -13,32 +25,11 @@ const PLATFORM = IS_TWITTER ? "twitter" : IS_LINKEDIN ? "linkedin" : "universal"
 // "short but worth classifying" range (see buildPrompt in background.js).
 const MIN_POST_CHARS = 20;
 
-// ── Default-excluded sites ────────────────────────────────────────────────
-// Universal mode scans any page, but these sites have no "slop feed" to
-// filter and scanning them is pure overhead (or actively annoying — e.g.
-// blurring your own chat messages). Matched as hostname substrings.
-const DEFAULT_EXCLUDED_SITES = [
-  "chatgpt.com", "chat.openai.com",
-  "claude.ai",
-  "gemini.google.com", "aistudio.google.com",
-  "mail.google.com", "outlook.com", "outlook.live.com",
-  "gmail.com",
-  "docs.google.com", "drive.google.com", "calendar.google.com",
-  "meet.google.com", "notion.so", "figma.com",
-  "github.com", "gitlab.com", "stackoverflow.com",
-  "localhost", "127.0.0.1",
-];
-
-function isExcludedSite(hostname, extraList) {
-  const all = DEFAULT_EXCLUDED_SITES.concat(extraList || []);
-  return all.some(s => s && hostname.includes(s));
-}
-
 // ── Settings ──────────────────────────────────────────────────────────────
 let settings = {
   darkMode: false, showTrashCan: true,
-  minConfidence: 60, universalMode: true, hideSlop: false,
-  excludedSites: [], // user-added extra exclusions
+  minConfidence: 90, hideSlop: false,
+  excludedSites: [], // user-added hostnames to skip even among supported sites
   showTrainingButtons: true, // show "Confirm slop" / "Not slop" training buttons
   nonIntrusiveMode: false,    // hide slop quietly — no banners, no training UI
   removeEntirely: false,      // when hiding, remove the element from the DOM completely
@@ -90,8 +81,19 @@ function loadSettings(cb) {
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "settingsUpdated") {
+    const prev = settings;
     settings = { ...settings, ...request.settings };
     applyTheme(IS_TWITTER ? "dark" : (settings.darkMode ? "dark" : "light"));
+    // Display-mode changes must re-render already-flagged cards — otherwise
+    // switching e.g. "banner" → "remove entirely" leaves existing slop cards
+    // showing the old treatment (they're already in evaluatedWrappers and
+    // would never be reprocessed). Detect a relevant change and reapply.
+    const displayChanged =
+      prev.hideSlop !== settings.hideSlop ||
+      prev.removeEntirely !== settings.removeEntirely ||
+      prev.nonIntrusiveMode !== settings.nonIntrusiveMode ||
+      prev.showTrainingButtons !== settings.showTrainingButtons;
+    if (displayChanged) reapplyAllSlopCards();
   }
   if (request.action === "queueSize") { currentQueueSize = request.size; }
   if (request.action === "getPageStats") {
@@ -395,13 +397,17 @@ slopStyle.textContent = `
     padding-top: var(--sr-banner-h, 44px) !important;
   }
 
-  /* LinkedIn/universal collapse */
+  /* LinkedIn/universal/reddit/threads collapse */
   .slop_radar_linkedin[data-slop-detected="true"]:not([data-sr-revealed]):not(.sr_hide_mode),
-  .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]):not(.sr_hide_mode) {
+  .slop_radar_universal[data-slop-detected="true"]:not([data-sr-revealed]):not(.sr_hide_mode),
+  .slop_radar_reddit[data-slop-detected="true"]:not([data-sr-revealed]):not(.sr_hide_mode),
+  .slop_radar_threads[data-slop-detected="true"]:not([data-sr-revealed]):not(.sr_hide_mode) {
     max-height: 80px !important; overflow: hidden !important;
   }
   .slop_radar_linkedin[data-slop-detected="true"][data-sr-revealed],
-  .slop_radar_universal[data-slop-detected="true"][data-sr-revealed] {
+  .slop_radar_universal[data-slop-detected="true"][data-sr-revealed],
+  .slop_radar_reddit[data-slop-detected="true"][data-sr-revealed],
+  .slop_radar_threads[data-slop-detected="true"][data-sr-revealed] {
     max-height: 3000px !important; overflow: visible !important;
   }
 
@@ -589,6 +595,20 @@ function getUniversalWrapper(textNode) {
 function getPostWrapper(textNode) {
   if (IS_TWITTER) return getTwitterWrapper(textNode);
   if (IS_LINKEDIN) return getLinkedInWrapper(textNode);
+  if (IS_REDDIT) {
+    // Prefer the post/comment custom elements; fall back to universal walk-up.
+    const el = textNode.parentElement;
+    const w = el?.closest('shreddit-post, [data-testid="post-container"], ' +
+      'shreddit-comment, [data-testid="comment"]');
+    if (w) return w;
+    return getUniversalWrapper(textNode);
+  }
+  if (IS_THREADS) {
+    const el = textNode.parentElement;
+    const w = el?.closest('div[data-pressable-container], article');
+    if (w) return w;
+    return getUniversalWrapper(textNode);
+  }
   return getUniversalWrapper(textNode);
 }
 
@@ -996,6 +1016,24 @@ function getTextSelectors() {
       'span[dir="ltr"]',
     ].join(',');
   }
+  if (IS_REDDIT) {
+    // Reddit (new + shreddit): post bodies live in these containers. Beta —
+    // the wrapper resolution falls back to the generic walk-up.
+    return [
+      '[data-testid="post-content"] [property="schema:articleBody"]',
+      'shreddit-post [slot="text-body"]',
+      '[data-click-id="text"]',
+      '.md',                       // old reddit / comment markdown
+      '[data-testid="comment"]',
+    ].join(',');
+  }
+  if (IS_THREADS) {
+    // Threads marks post text spans with dir="auto" inside article elements.
+    return [
+      'article span[dir="auto"]',
+      'div[data-pressable-container] span[dir="auto"]',
+    ].join(',');
+  }
   return 'p, [class*="post"] p, [class*="content"] p, article p';
 }
 
@@ -1034,15 +1072,19 @@ async function drainOne() {
   chrome.runtime.sendMessage(
     { action: "evaluatePost", text: rawText.substring(0, 1500), tabId: MY_TAB_ID },
     (response) => {
-      // ── Service worker failure handling ────────────────────────────────
-      // When X is left open a long time the MV3 service worker goes idle
-      // and may drop messages, producing chrome.runtime.lastError or an
-      // undefined response. The old code stamped these as confidence 50,
-      // which is the "everything is 50%" bug. Instead: do NOT stamp, do
-      // NOT cache — re-queue the post so it retries once the worker wakes.
+      // ── Service worker / model failure handling ────────────────────────
+      // Two failure shapes, both must NOT be stamped:
+      //  • empty/undefined response → MV3 worker asleep or dropped the message
+      //  • { degraded: true } → the Gemini session returned garbage for this
+      //    (and probably every) post. Background recreates the session after
+      //    a few of these; meanwhile we just re-queue and wait.
+      // The old code stamped these as confidence 50, which is the
+      // "everything is 50% not slop" bug. Instead: don't stamp, don't cache,
+      // re-queue so it retries once the model is healthy again.
       const failed = chrome.runtime.lastError ||
                      !response ||
-                     typeof response.isSlop === "undefined";
+                     response.degraded === true ||
+                     (typeof response.isSlop === "undefined" && !response.stale);
 
       if (failed) {
         swFailureStreak++;
@@ -1052,15 +1094,17 @@ async function drainOne() {
           pendingNodes.push({ textNode, wrapper });
         }
         if (swFailureStreak === 1 || swFailureStreak % 10 === 0) {
+          const why = response?.degraded ? "model returned degraded output — kickstarting"
+            : (chrome.runtime.lastError?.message || "empty response");
           srLog(
-            `⚠ service worker not responding ` +
-            `(streak ${swFailureStreak}) — re-queued post, will retry. ` +
-            (chrome.runtime.lastError?.message || "empty response")
+            `⚠ classification unavailable ` +
+            `(streak ${swFailureStreak}) — re-queued post, will retry. ${why}`
           );
         }
-        // Back off a little so we don't hammer a dead worker.
+        // Back off so we don't hammer a dead/recovering worker. Cap higher
+        // for degraded streaks since session recreation takes a moment.
         setTimeout(() => requestAnimationFrame(drainOne),
-          Math.min(2000, 150 * swFailureStreak));
+          Math.min(4000, 200 * swFailureStreak));
         return;
       }
 
@@ -1076,9 +1120,19 @@ async function drainOne() {
         return;
       }
 
-      const confidence = response.confidence ?? 50;
-      if (response.isSlop) applySlop(wrapper, confidence);
-      else applyNotSlop(wrapper, confidence);
+      const confidence = response.confidence ?? 70;
+      if (response.isSlop) {
+        applySlop(wrapper, confidence);
+      } else if (response.lowConfidence) {
+        // Slop suspected but below the user's confidence bar — show it
+        // normally but do NOT cache as a settled not-slop verdict, so it
+        // gets re-evaluated if the threshold changes. We mark the wrapper
+        // evaluated for this session only (no cache write).
+        evaluatedWrappers.add(wrapper);
+        wrapper.dataset.srStampedText = (textNode.textContent || "").trim().substring(0, 120);
+      } else {
+        applyNotSlop(wrapper, confidence);
+      }
       requestAnimationFrame(drainOne);
     }
   );
@@ -1156,14 +1210,40 @@ function resetWrapper(wrapper) {
   wrapper.removeAttribute("data-slop-detected");
   wrapper.removeAttribute("data-sr-revealed");
   delete wrapper.dataset.srStampedText;
-  wrapper.classList.remove("slop_radar_card", "sr_hide_mode",
-    "slop_radar_twitter", "slop_radar_linkedin", "slop_radar_universal");
+  wrapper.classList.remove("slop_radar_card", "sr_hide_mode", "sr_noninstrusive",
+    "slop_radar_twitter", "slop_radar_linkedin", "slop_radar_universal",
+    "slop_radar_reddit", "slop_radar_threads");
   wrapper.querySelector(".slop_dog_ear")?.remove();
   wrapper.querySelector(".not_slop_dog_ear")?.remove();
   wrapper.querySelector(".not_slop_tw_wrap")?.remove();
   wrapper.querySelector(".sr_blur_cover")?.remove();
+  wrapper.querySelector(".sr_pattern_feedback")?.remove();
   wrapper.style.removeProperty("max-height");
   wrapper.style.removeProperty("overflow");
+  wrapper.style.removeProperty("display"); // remove-entirely mode sets this
+  wrapper.style.removeProperty("padding-top");
+}
+
+// Re-render every currently-flagged slop card using the current display-mode
+// settings. Called when the user changes Hide/Remove/Non-intrusive/training
+// settings while a feed is already classified. We reuse the cached verdict so
+// no new AI calls are made.
+function reapplyAllSlopCards() {
+  const flagged = document.querySelectorAll('[data-slop-detected="true"]');
+  let n = 0;
+  flagged.forEach(wrapper => {
+    // Pull the cached verdict by the wrapper's stamped text before resetting.
+    const txt = wrapper.textContent?.trim().substring(0, 800) || "";
+    const cached = cacheGetVerdict(txt);
+    resetWrapper(wrapper);
+    if (cached && cached.isSlop) {
+      applySlop(wrapper, cached.confidence, true); // fromCache: no stat double-count
+      n++;
+    }
+  });
+  // Also handle remove-entirely cards that were display:none'd (they keep
+  // data-slop-detected, so the selector above already caught them).
+  if (n > 0) srLog(`re-rendered ${n} slop card(s) for new display mode`);
 }
 
 function queueContainerCheck(node) {
@@ -1417,17 +1497,24 @@ window.addEventListener("scroll", () => {
 loadSettings(() => {
   applyTheme(IS_TWITTER ? "dark" : (settings.darkMode ? "dark" : "light"));
 
-  // Skip default-excluded sites (ChatGPT, Claude, Gmail, etc.) entirely.
-  // X and LinkedIn always run — they are the whole point of the extension.
-  if (!IS_TWITTER && !IS_LINKEDIN &&
-      isExcludedSite(PAGE_HOSTNAME, settings.excludedSites)) {
-    srLog(`${PAGE_HOSTNAME} is on the excluded list — not scanning.`);
+  // The manifest only injects this script on supported social sites, so we
+  // no longer maintain a default exclusion list. Users can still exclude a
+  // specific supported host (e.g. they want it on LinkedIn but not Reddit).
+  const userExcluded = (settings.excludedSites || [])
+    .some(s => s && PAGE_HOSTNAME.includes(s));
+  if (userExcluded) {
+    srLog(`${PAGE_HOSTNAME} is on your excluded list — not scanning.`);
     return;
   }
 
   if (isSitePaused()) {
     showSitePauseBanner();
     return; // don't sweep, don't process
+  }
+
+  if (IS_BETA_PLATFORM) {
+    srLog(`${PLATFORM} support is beta — using the generic detector. ` +
+      `Detection may be less precise than on LinkedIn/X.`);
   }
 
   startSweeping();

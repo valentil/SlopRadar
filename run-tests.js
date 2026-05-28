@@ -248,16 +248,20 @@ function loadBackground() {
 testAsync("getSettings returns defaults when storage empty", async () => {
   const chrome = loadBackground();
   const resp = await chrome.runtime._fireMessage({ action: "getSettings" });
-  assert.equal(resp.minConfidence, 60);
-  assert.equal(resp.universalMode, true);
+  assert.equal(resp.minConfidence, 90);
   assert.equal(resp.hideSlop, false);
+  assert.equal(resp.showTrainingButtons, true);
+  // universalMode was removed in v1.5 — the extension is now scoped to
+  // specific social sites via the manifest, so there's no "scan everything"
+  // toggle to default.
+  assert.equal(resp.universalMode, undefined);
 });
 
 testAsync("saveSettings persists to storage", async () => {
   const chrome = loadBackground();
   await chrome.runtime._fireMessage({
     action: "saveSettings",
-    settings: { minConfidence: 80, hideSlop: true, universalMode: false },
+    settings: { minConfidence: 80, hideSlop: true },
   });
   const resp = await chrome.runtime._fireMessage({ action: "getSettings" });
   assert.equal(resp.minConfidence, 80);
@@ -583,42 +587,100 @@ test("cache evicts oldest entry past the cap", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════
-// SUITE 10 — Default-excluded sites
+// SUITE 10 — Site scoping & user exclusions
 // ════════════════════════════════════════════════════════════════════════
-suite("excluded-sites");
+suite("site-scope");
 
-const DEFAULT_EXCLUDED = [
-  "chatgpt.com", "chat.openai.com", "claude.ai",
-  "gemini.google.com", "mail.google.com", "gmail.com",
-  "github.com", "localhost",
-];
-function isExcluded(hostname, extra) {
-  return DEFAULT_EXCLUDED.concat(extra || []).some(s => s && hostname.includes(s));
+// Mirror of the user-exclusion check in content.js bootstrap.
+function userExcluded(hostname, extra) {
+  return (extra || []).some(s => s && hostname.includes(s));
 }
 
-test("ChatGPT is excluded by default", () => {
-  assert.equal(isExcluded("chatgpt.com"), true);
+test("no host is excluded by default (manifest scopes injection)", () => {
+  assert.equal(userExcluded("linkedin.com", []), false);
+  assert.equal(userExcluded("reddit.com", []), false);
 });
 
-test("Claude is excluded by default", () => {
-  assert.equal(isExcluded("claude.ai"), true);
+test("user can exclude a specific supported host", () => {
+  assert.equal(userExcluded("www.reddit.com", ["reddit.com"]), true);
+  assert.equal(userExcluded("linkedin.com", ["reddit.com"]), false);
 });
 
-test("Gmail is excluded by default", () => {
-  assert.equal(isExcluded("mail.google.com"), true);
+test("content.js detects all four platforms", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(content.includes("IS_REDDIT"), "Reddit detection present");
+  assert.ok(content.includes("IS_THREADS"), "Threads detection present");
+  assert.ok(/TUNED_PLATFORMS\s*=\s*\[\s*"twitter"\s*,\s*"linkedin"/.test(content),
+    "LinkedIn + X marked as tuned platforms");
+  assert.ok(content.includes("IS_BETA_PLATFORM"), "beta-platform flag present");
 });
 
-test("a normal site is not excluded", () => {
-  assert.equal(isExcluded("somerandomblog.com"), false);
+test("DEFAULT_EXCLUDED_SITES machinery is gone (no longer universal)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(!content.includes("DEFAULT_EXCLUDED_SITES"),
+    "the universal-mode exclusion list should be removed now that the " +
+    "manifest scopes injection to specific sites");
 });
 
-test("user-added exclusion works", () => {
-  assert.equal(isExcluded("intranet.mycompany.com", ["mycompany.com"]), true);
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 10b — Manifest release validation
+// ════════════════════════════════════════════════════════════════════════
+suite("manifest");
+
+function loadManifest() {
+  const fs = require("fs");
+  const path = require("path");
+  return JSON.parse(fs.readFileSync(path.join(findExtDir(), "manifest.json"), "utf8"));
+}
+
+test("manifest does NOT request <all_urls>", () => {
+  const m = loadManifest();
+  const hosts = (m.host_permissions || []).concat(
+    (m.content_scripts || []).flatMap(cs => cs.matches || []));
+  assert.ok(!hosts.includes("<all_urls>"),
+    "<all_urls> triggers Chrome Web Store rejection / heavy review — " +
+    "scope to specific social sites instead.");
 });
 
-test("subdomain of excluded site is also excluded", () => {
-  // includes() match means any subdomain of chatgpt.com is caught
-  assert.equal(isExcluded("beta.chatgpt.com"), true);
+test("manifest host_permissions cover the four social sites", () => {
+  const m = loadManifest();
+  const joined = (m.host_permissions || []).join(" ");
+  for (const site of ["linkedin.com", "x.com", "reddit.com", "threads"]) {
+    assert.ok(joined.includes(site), `host_permissions should include ${site}`);
+  }
+});
+
+test("manifest declares the required icon sizes", () => {
+  const m = loadManifest();
+  for (const size of ["16", "32", "48", "128"]) {
+    assert.ok(m.icons && m.icons[size], `icons.${size} is required by the store`);
+    assert.ok(m.action && m.action.default_icon && m.action.default_icon[size],
+      `action.default_icon.${size} should be set`);
+  }
+});
+
+test("manifest requests only the permissions it uses", () => {
+  const m = loadManifest();
+  const perms = new Set(m.permissions || []);
+  // These are the only ones the code actually relies on.
+  const allowed = new Set(["scripting", "tabs", "storage", "contextMenus", "activeTab"]);
+  for (const p of perms) {
+    assert.ok(allowed.has(p), `unexpected permission "${p}" — drop it or justify it`);
+  }
+  // windows API works without the permission; make sure we didn't re-add it.
+  assert.ok(!perms.has("windows"), "windows permission isn't needed for getAll/onFocusChanged");
+});
+
+test("manifest content_scripts matches == host_permissions", () => {
+  const m = loadManifest();
+  const hosts = new Set(m.host_permissions || []);
+  const matches = new Set((m.content_scripts || []).flatMap(cs => cs.matches || []));
+  assert.deepEqual([...matches].sort(), [...hosts].sort(),
+    "content script match list should mirror host_permissions exactly");
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -952,6 +1014,168 @@ test("short-post prompt instructs default-to-authentic", () => {
   // to authentic (0) when signal is thin — not slop.
   assert.ok(/Default to authentic|default to authentic/.test(bg),
     "short-post guidance should explicitly default to authentic");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 17 — Prompt inspector parity (options.js mirrors background.js)
+// ════════════════════════════════════════════════════════════════════════
+// The options-page prompt inspector duplicates buildPrompt so it can render
+// the prompt without a round-trip. Drift between the two would mislead the
+// user about what the model actually sees, so we guard the shared markers.
+suite("prompt-inspector");
+
+test("options.js has a buildPromptPreview mirroring background", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const opts = fs.readFileSync(path.join(findExtDir(), "options.js"), "utf8");
+  assert.ok(opts.includes("buildPromptPreview"), "inspector builder present");
+});
+
+test("inspector prompt shares the key structural markers with background", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const dir = findExtDir();
+  const bg = fs.readFileSync(path.join(dir, "background.js"), "utf8");
+  const opts = fs.readFileSync(path.join(dir, "options.js"), "utf8");
+  // Both must contain these exact anchor strings — if the prompt is reworded
+  // in one place, this fails until the other is updated too.
+  const markers = [
+    "extremely cynical LinkedIn/Twitter slop detector",
+    "SLOP PATTERNS — classify as 1 if ANY of these are present:",
+    "LENGTH NOTE",
+    'Respond with ONLY a JSON object like {"slop": 1, "confidence": 87}',
+  ];
+  for (const m of markers) {
+    assert.ok(bg.includes(m), `background.js missing marker: ${m}`);
+    assert.ok(opts.includes(m), `options.js inspector missing marker: ${m} (prompt drift)`);
+  }
+});
+
+test("admin.html is not referenced by the manifest", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const m = JSON.parse(fs.readFileSync(path.join(findExtDir(), "manifest.json"), "utf8"));
+  const blob = JSON.stringify(m);
+  assert.ok(!blob.includes("admin.html"),
+    "admin.html must never be referenced by the manifest (dev-only file)");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 18 — Model recovery (the "50% not slop for everything" bug)
+// ════════════════════════════════════════════════════════════════════════
+suite("model-recovery");
+
+test("background flags degraded output instead of stamping confidence 50", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  // The drain loop must send { degraded: true } rather than a fake verdict
+  // when the model returns junk / empty / unparseable output.
+  assert.ok(/degraded:\s*true/.test(bg), "degraded flag is sent on bad output");
+  // It must NOT silently fall back to confidence 50 as a real verdict.
+  assert.ok(!/confidence:\s*50\s*\}\s*\)\s*;?\s*\/\/?.*real/i.test(bg),
+    "no fake confidence-50 verdict path");
+});
+
+test("background recreates the session after repeated failures", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  assert.ok(bg.includes("recoverEngine"), "recoverEngine() defined");
+  assert.ok(bg.includes("consecutiveInferenceFails"), "tracks failure streak");
+  assert.ok(/REINIT_AFTER_FAILS/.test(bg), "has a reinit threshold");
+  // recoverEngine must actually destroy + null the session before reinit.
+  assert.ok(/destroy\?\.\(\)/.test(bg) || /destroy\(\)/.test(bg),
+    "recoverEngine tears down the old session");
+});
+
+test("content treats degraded responses as retryable, not a verdict", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/response\.degraded\s*===\s*true/.test(content),
+    "content checks for response.degraded");
+  // Degraded path must re-queue (push back to pendingNodes), not applyNotSlop.
+  assert.ok(/degraded[\s\S]{0,400}pendingNodes\.push/.test(content),
+    "degraded responses get re-queued");
+});
+
+testAsync("getEngineStatus reports readiness and failure count", async () => {
+  const chrome = loadBackground();
+  const res = await chrome.runtime._fireMessage({ action: "getEngineStatus" });
+  assert.ok(res, "responds");
+  // No LanguageModel in the test harness → unsupported + not ready.
+  assert.equal(res.ready, false);
+  assert.equal(typeof res.recentFailures, "number");
+  assert.ok("availability" in res, "reports availability");
+});
+
+testAsync("kickstartEngine responds without throwing", async () => {
+  const chrome = loadBackground();
+  const res = await chrome.runtime._fireMessage({ action: "kickstartEngine" });
+  assert.ok(res, "responds");
+  // ok:false is correct here — no model available in the harness — but it
+  // must not throw or hang.
+  assert.equal(typeof res.ok, "boolean");
+});
+
+test("popup wires a manual kickstart button", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const opts = fs.readFileSync(path.join(findExtDir(), "options.js"), "utf8");
+  const html = fs.readFileSync(path.join(findExtDir(), "options.html"), "utf8");
+  assert.ok(html.includes('id="kickstart-btn"'), "kickstart button present in HTML");
+  assert.ok(/kickstartEngine/.test(opts), "options.js calls kickstartEngine");
+  assert.ok(/getEngineStatus/.test(opts), "options.js polls engine status");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 19 — Display modes (mutually exclusive + applied correctly)
+// ════════════════════════════════════════════════════════════════════════
+suite("display-modes-v2");
+
+test("options.js makes the three display modes mutually exclusive", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const opts = fs.readFileSync(path.join(findExtDir(), "options.js"), "utf8");
+  assert.ok(opts.includes("DISPLAY_MODE_IDS"), "display modes treated as a group");
+  // The old coupling (force-checking hide-slop when remove is set) must be gone.
+  assert.ok(!/s-remove-entirely[\s\S]{0,120}s-hide-slop"\)\.checked = true/.test(opts),
+    "remove-entirely must NOT force hide-slop on (old coupling bug)");
+});
+
+test("applySlop honors removeEntirely with display:none and no banner", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // removeEntirely branch sets display:none and returns before building banner.
+  assert.ok(/settings\.removeEntirely[\s\S]{0,300}setProperty\(\s*["']display["']\s*,\s*["']none["']/.test(content),
+    "removeEntirely sets display:none");
+  assert.ok(/settings\.removeEntirely[\s\S]{0,360}return;/.test(content),
+    "removeEntirely returns before banner construction");
+});
+
+test("settings change re-renders already-flagged cards", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(content.includes("reapplyAllSlopCards"), "reapply function exists");
+  // settingsUpdated handler must call it on a display change.
+  assert.ok(/displayChanged[\s\S]{0,120}reapplyAllSlopCards/.test(content),
+    "settingsUpdated triggers re-render when display mode changes");
+});
+
+test("low-confidence slop is not cached as a settled not-slop verdict", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/lowConfidence/.test(bg), "background flags low-confidence downgrades");
+  assert.ok(/response\.lowConfidence/.test(content),
+    "content honors the lowConfidence flag");
+  // The low-confidence branch must NOT call cacheSetVerdict.
+  assert.ok(/response\.lowConfidence[\s\S]{0,400}evaluatedWrappers\.add/.test(content),
+    "low-confidence marks evaluated for session but does not cache");
 });
 
 

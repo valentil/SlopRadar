@@ -54,10 +54,9 @@ const MAX_PATTERN_TOKENS = 3000; // rough char budget before we compact
 const DEFAULT_SETTINGS = {
   darkMode: false,
   showTrashCan: true,
-  minConfidence: 60,
-  universalMode: true,
+  minConfidence: 90,
   hideSlop: false, // hide slop cards entirely instead of blur/collapse
-  excludedSites: [], // extra user-added hostnames to skip in universal mode
+  excludedSites: [], // user-added hostnames to skip among supported sites
   showTrainingButtons: true, // show Confirm/Not-slop buttons on slop cards
   nonIntrusiveMode: false,   // quiet mode — hide slop, no banners or buttons
   removeEntirely: false,     // remove slop elements from the DOM completely
@@ -161,21 +160,87 @@ async function saveSettings(settings) {
 
 // ── AI engine ─────────────────────────────────────────────────────────────
 let aiSession = null;
+let engineInitInFlight = null;   // de-dupe concurrent (re)inits
+let consecutiveInferenceFails = 0; // health counter for the classify loop
+const REINIT_AFTER_FAILS = 3;    // recreate the session after this many in a row
+
+async function createSession() {
+  if (typeof LanguageModel === 'undefined') {
+    console.warn("[SlopRadar] LanguageModel API unavailable in this browser.");
+    return null;
+  }
+  // Check availability so we can distinguish "model downloading" from "broken".
+  try {
+    if (typeof LanguageModel.availability === "function") {
+      const avail = await LanguageModel.availability();
+      if (avail === "unavailable") {
+        console.warn("[SlopRadar] Gemini Nano unavailable on this device.");
+        return null;
+      }
+      // "downloadable" / "downloading" → create() will trigger/await it.
+    }
+  } catch (_) {}
+  return await LanguageModel.create({
+    systemPrompt: "You are a precise assistant. Follow instructions exactly. Output only what is asked for — no preamble, no explanation, no markdown."
+  });
+}
 
 async function initEngine() {
-  try {
-    if (typeof LanguageModel === 'undefined') return;
-    aiSession = await LanguageModel.create({
-      systemPrompt: "You are a precise assistant. Follow instructions exactly. Output only what is asked for — no preamble, no explanation, no markdown."
-    });
-    drainQueue();
-  } catch (err) {
-    console.error("[SlopRadar] Engine init failed:", err);
-  }
+  // Coalesce — multiple callers (onInstalled, onStartup, recovery) shouldn't
+  // each spin up a session.
+  if (engineInitInFlight) return engineInitInFlight;
+  engineInitInFlight = (async () => {
+    try {
+      aiSession = await createSession();
+      consecutiveInferenceFails = 0;
+      if (aiSession) drainQueue();
+    } catch (err) {
+      console.error("[SlopRadar] Engine init failed:", err);
+      aiSession = null;
+    } finally {
+      engineInitInFlight = null;
+    }
+  })();
+  return engineInitInFlight;
+}
+
+// Tear down and rebuild the session — called when inference repeatedly fails,
+// which is the classic MV3 "model got into a bad state and returns garbage
+// for everything" situation. Recreating the LanguageModel session is the
+// reliable kickstart.
+async function recoverEngine(reason) {
+  console.warn(`[SlopRadar] Recovering Gemini session — ${reason}`);
+  try { aiSession?.destroy?.(); } catch (_) {}
+  aiSession = null;
+  consecutiveInferenceFails = 0;
+  await initEngine();
+  return !!aiSession;
 }
 
 chrome.runtime.onInstalled.addListener(initEngine);
 chrome.runtime.onStartup.addListener(initEngine);
+
+// ── One-time migrations ────────────────────────────────────────────────────
+// v1.5 changed userTaughtPatterns from "prompt-style anti-patterns" to narrow
+// page-side text fingerprints. Entries created before 1.5 are the wrong shape
+// (long generalized rules rather than short fingerprints) and would never
+// match as fingerprints, so we clear them once on upgrade. The core
+// slopPatterns list is untouched — only the right-click bucket is reset.
+chrome.runtime.onInstalled.addListener(async (details) => {
+  if (details.reason !== "update") return;
+  try {
+    const data = await storageGet(["userTaughtPatterns", "srMigratedTo15"]);
+    if (data.srMigratedTo15) return;
+    const old = Array.isArray(data.userTaughtPatterns) ? data.userTaughtPatterns : [];
+    if (old.length > 0) {
+      console.log(`[SlopRadar] Migration v1.5: clearing ${old.length} legacy ` +
+        `right-click pattern(s) — they predate the page-fingerprint redesign.`);
+    }
+    await storageSet({ userTaughtPatterns: [], srMigratedTo15: true });
+  } catch (err) {
+    console.error("[SlopRadar] v1.5 migration failed:", err);
+  }
+});
 
 // ── Learn from slop (trash-can / confirm-slop button) ─────────────────────
 // Writes to slopPatterns so the prompt stays complete.
@@ -512,23 +577,74 @@ async function drainQueue() {
 
     try {
       const result = await aiSession.prompt(buildPrompt(item.text, patterns));
-      const rawOutput = result.trim();
-      let isSlop = false, confidence = 50;
-      try {
-        const parsed = JSON.parse(rawOutput.replace(/```json|```/g, "").trim());
-        isSlop = parsed.slop === 1;
-        confidence = Math.min(100, Math.max(1, Math.round(parsed.confidence ?? 50)));
-      } catch (_) {
-        isSlop = rawOutput.match(/[01]/)?.[0] === "1";
-        confidence = 50;
+      const rawOutput = (result || "").trim();
+
+      // Parse the verdict. Critically, we distinguish three outcomes:
+      //  • clean JSON with a real confidence → a genuine verdict
+      //  • parseable-ish but no confidence / garbage → DEGRADED (don't trust)
+      //  • empty output → DEGRADED
+      // A degraded model returns junk for everything, which used to be
+      // silently stamped as {isSlop:false, confidence:50} — the "50% not
+      // slop for everything" bug. We now flag it so the page won't stamp it
+      // and we can kickstart the session.
+      let isSlop = false, confidence = null, degraded = false;
+
+      if (!rawOutput) {
+        degraded = true;
+      } else {
+        try {
+          const parsed = JSON.parse(rawOutput.replace(/```json|```/g, "").trim());
+          if (typeof parsed.slop === "undefined" || typeof parsed.confidence === "undefined") {
+            degraded = true; // model returned JSON but not OUR schema
+          } else {
+            isSlop = parsed.slop === 1;
+            confidence = Math.min(100, Math.max(1, Math.round(parsed.confidence)));
+          }
+        } catch (_) {
+          // Couldn't parse at all. Only trust a bare 0/1 if it's basically the
+          // entire output — otherwise treat as degraded rather than guessing 50.
+          const m = rawOutput.match(/^[^01]*([01])[^0-9]*$/);
+          if (m) { isSlop = m[1] === "1"; confidence = 70; }
+          else { degraded = true; }
+        }
       }
-      // Apply min confidence threshold from settings
-      if (isSlop && confidence < settings.minConfidence) isSlop = false;
-      console.log(`[SlopRadar] tab=${item.tabId} verdict=${isSlop ? "SLOP" : "OK"} conf=${confidence}%`);
-      item.sendResponse({ isSlop, confidence });
+
+      if (degraded) {
+        consecutiveInferenceFails++;
+        console.warn(`[SlopRadar] Degraded model output (streak ${consecutiveInferenceFails}): ${JSON.stringify(rawOutput).slice(0, 120)}`);
+        item.sendResponse({ degraded: true });
+        if (consecutiveInferenceFails >= REINIT_AFTER_FAILS) {
+          // Don't block this loop iteration on recovery; kick it off and bail.
+          recoverEngine(`${consecutiveInferenceFails} consecutive degraded outputs`);
+          draining = false;
+          return;
+        }
+        continue;
+      }
+
+      // Healthy verdict.
+      consecutiveInferenceFails = 0;
+      // A slop post below the user's confidence bar is downgraded to "not
+      // shown" — but it is NOT a confident "authentic" verdict. Flag it so
+      // the page doesn't cache it as a settled not-slop result; if the user
+      // later lowers the threshold it should be re-evaluated.
+      let lowConfidence = false;
+      if (isSlop && confidence < settings.minConfidence) {
+        isSlop = false;
+        lowConfidence = true;
+      }
+      console.log(`[SlopRadar] tab=${item.tabId} verdict=${isSlop ? "SLOP" : "OK"} conf=${confidence}%${lowConfidence ? " (downgraded)" : ""}`);
+      item.sendResponse({ isSlop, confidence, lowConfidence });
     } catch (err) {
       console.error("[SlopRadar] Inference error:", err);
-      try { item.sendResponse({ isSlop: false, confidence: 50 }); } catch (_) {}
+      consecutiveInferenceFails++;
+      // Tell the page this was a failure, not a real "not slop" verdict.
+      try { item.sendResponse({ degraded: true }); } catch (_) {}
+      if (consecutiveInferenceFails >= REINIT_AFTER_FAILS) {
+        recoverEngine(`${consecutiveInferenceFails} consecutive inference errors`);
+        draining = false;
+        return;
+      }
     }
   }
 
@@ -684,6 +800,38 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === "getStats") {
     getStats().then(stats => sendResponse(stats));
+    return true;
+  }
+
+  // Engine health — lets the popup show whether the local model is ready and
+  // whether it has been struggling (consecutive failures).
+  if (request.action === "getEngineStatus") {
+    let availability = "unknown";
+    (async () => {
+      try {
+        if (typeof LanguageModel !== "undefined" && typeof LanguageModel.availability === "function") {
+          availability = await LanguageModel.availability();
+        } else if (typeof LanguageModel === "undefined") {
+          availability = "unsupported";
+        }
+      } catch (_) {}
+      sendResponse({
+        ready: !!aiSession,
+        availability,
+        recentFailures: consecutiveInferenceFails,
+      });
+    })();
+    return true;
+  }
+
+  // Manual kickstart — user-triggered session rebuild from the popup, for
+  // when the model gets wedged and they don't want to wait for the auto-retry.
+  if (request.action === "kickstartEngine") {
+    recoverEngine("manual kickstart from popup").then(ok => {
+      // Nudge any open supported tabs to retry their pending queues.
+      if (ok) drainQueue();
+      sendResponse({ ok });
+    });
     return true;
   }
 

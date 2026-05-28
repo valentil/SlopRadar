@@ -166,6 +166,12 @@
   /* Toggle switch */
   .toggle { position: relative; width: 36px; height: 20px; flex-shrink: 0; }
   .toggle input { opacity: 0; width: 0; height: 0; }
+  .site-chip {
+    display: inline-block; padding: 3px 10px; border-radius: 12px;
+    font-size: 0.68rem; font-weight: 600; border: 1px solid var(--border);
+  }
+  .site-chip.tuned { background: rgba(224,36,36,0.12); color: var(--red); border-color: rgba(224,36,36,0.3); }
+  .site-chip.beta { background: var(--surface2, rgba(128,128,128,0.12)); color: var(--text2); }
   .toggle-track {
     position: absolute; inset: 0;
     background: var(--border); border-radius: 20px;
@@ -304,6 +310,17 @@
     <div id="s-paused-sites-list" style="margin-top:8px"></div>
   </div>
 
+  <div class="setting-group" style="margin-bottom:18px">
+    <div class="setting-group-title">Local AI engine</div>
+    <div class="setting-row" style="border-bottom:none;padding-bottom:2px">
+      <div>
+        <div class="setting-label" id="engine-status-label">Checking…</div>
+        <div class="setting-desc" id="engine-status-desc">Gemini Nano runs on your device</div>
+      </div>
+      <button class="btn" id="kickstart-btn" style="flex-shrink:0">Restart</button>
+    </div>
+  </div>
+
   <div class="section-header">
     <h2>Performance</h2>
     <span class="queue-pill" id="queue-pill">
@@ -373,17 +390,23 @@
   </div>
 
   <div class="setting-group">
-    <div class="setting-group-title">Detection</div>
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Universal mode</div>
-        <div class="setting-desc">Scan any webpage for slop, not just LinkedIn and X (on by default)</div>
-      </div>
-      <label class="toggle">
-        <input type="checkbox" id="s-universal-mode"/>
-        <span class="toggle-track"></span>
-      </label>
+    <div class="setting-group-title">Supported sites</div>
+    <div style="font-size:0.72rem;color:var(--text2);margin-bottom:8px">
+      SlopRadar runs on these social feeds. LinkedIn and X are fully tuned;
+      Reddit and Threads are in beta and use a more general detector.
     </div>
+    <div class="setting-row" style="border-bottom:none;padding-bottom:2px">
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        <span class="site-chip tuned">LinkedIn</span>
+        <span class="site-chip tuned">X / Twitter</span>
+        <span class="site-chip beta">Reddit · beta</span>
+        <span class="site-chip beta">Threads · beta</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="setting-group">
+    <div class="setting-group-title">Detection</div>
     <div class="setting-row">
       <div>
         <div class="setting-label">Hide slop entirely</div>
@@ -417,11 +440,11 @@
     <div class="setting-row">
       <div>
         <div class="setting-label">Minimum confidence to block</div>
-        <div class="setting-desc">Posts below this certainty threshold will not be hidden</div>
+        <div class="setting-desc">Only hide posts the model is at least this sure about. Higher = fewer false positives. Default 90%.</div>
       </div>
       <div class="range-wrap">
-        <input type="range" id="s-min-conf" min="40" max="95" step="5"/>
-        <span class="range-val" id="s-min-conf-val">60%</span>
+        <input type="range" id="s-min-conf" min="50" max="99" step="1"/>
+        <span class="range-val" id="s-min-conf-val">90%</span>
       </div>
     </div>
   </div>
@@ -455,7 +478,7 @@
     <div class="setting-row">
       <div>
         <div class="setting-label">Never scan these sites</div>
-        <div class="setting-desc">In universal mode, skip these hostnames entirely. ChatGPT, Claude, Gmail, Gemini and other common non-feed sites are already skipped by default.</div>
+        <div class="setting-desc">Skip these hostnames even though they're supported — e.g. run on LinkedIn but not Reddit. One hostname per entry.</div>
       </div>
     </div>
     <div style="display:flex;gap:6px;margin-top:4px">
@@ -512,6 +535,28 @@
         Every "Not slop" correction — what patterns were removed or narrowed and why.
       </div>
       <div id="notslop-log-list" style="max-height:260px;overflow-y:auto"></div>
+    </div>
+
+    <div style="margin-top:22px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <div class="setting-group-title" style="margin:0">Prompt inspector</div>
+        <button class="btn" id="prompt-inspect-toggle"
+          style="margin-left:auto;font-size:0.65rem;padding:3px 9px">Show</button>
+      </div>
+      <div style="font-size:0.68rem;color:var(--text2);margin-bottom:8px">
+        The exact text sent to Gemini Nano for classification, built live from the
+        core patterns above. Paste a test post to preview how it's framed.
+      </div>
+      <div id="prompt-inspect-body" style="display:none">
+        <textarea id="prompt-test-input" placeholder="Optional: paste a post to preview…"
+          style="width:100%;height:60px;background:var(--surface);border:1px solid var(--border);
+          border-radius:6px;padding:8px;color:var(--text);font-family:inherit;font-size:0.72rem;
+          margin-bottom:8px;resize:vertical"></textarea>
+        <pre id="prompt-inspect-out" style="white-space:pre-wrap;word-break:break-word;
+          background:var(--surface);border:1px solid var(--border);border-radius:6px;
+          padding:12px;font-size:0.7rem;line-height:1.5;max-height:380px;overflow-y:auto;
+          margin:0;font-family:ui-monospace,Menlo,monospace"></pre>
+      </div>
     </div>
   </div>
 </div>
@@ -573,7 +618,7 @@
         Built with <strong style="color:var(--text)">FeatureBoard.ai</strong>
       </a>
     </div>
-    <div style="margin-top:24px;font-size:0.65rem;color:var(--text2)">v1.4 — uses Gemini Nano on-device</div>
+    <div style="margin-top:24px;font-size:0.65rem;color:var(--text2)" id="about-version">uses Gemini Nano on-device</div>
   </div>
 </div>
 
