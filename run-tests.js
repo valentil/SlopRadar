@@ -1045,11 +1045,15 @@ test("inspector prompt shares the key structural markers with background", () =>
   // in one place, this fails until the other is updated too.
   const markers = [
     "careful detector of AI-generated marketing slop",
-    "SLOP PATTERNS — classify as 1 if ANY of these are present:",
+    "STEP 1 — CLASSIFY THE GENRE FIRST",
+    "STEP 2 — APPLY DIFFERENT SLOP THRESHOLDS BY GENRE",
+    "(A) NEWS REPORTING",
+    "(B) COMMENTARY / OPINION",
+    "SLOP PATTERNS (signals to count):",
     "LENGTH NOTE",
     "PLATFORM — LinkedIn",
     "PLATFORM — X / Twitter",
-    'Respond with ONLY a JSON object like {"slop": 1, "confidence": 87}',
+    'Respond with ONLY a JSON object: {"slop": 1, "confidence": 87, "reasons":',
   ];
   for (const m of markers) {
     assert.ok(bg.includes(m), `background.js missing marker: ${m}`);
@@ -1187,22 +1191,44 @@ test("prompt explicitly excludes news/political commentary from slop", () => {
   // The carve-out must mention news/events AND the no-slop-just-because rules.
   assert.ok(/news|current events|policy|politics|markets/i.test(out),
     "AUTHENTIC criteria explicitly include news/events");
-  assert.ok(/public figure|official|journalist|pundit/i.test(out),
+  assert.ok(/public figure|official|journalist|news aggregator/i.test(out),
     "AUTHENTIC criteria explicitly cover public figures/officials");
   assert.ok(/DO NOT classify as slop just because/i.test(out),
     "prompt has an explicit DO NOT list");
 });
 
-test("prompt no longer requires 'code or real numbers' to be authentic", () => {
+test("prompt uses two-step genre+threshold structure for news vs commentary", () => {
+  const bp = loadBuildPrompt();
+  // Real example that was being misclassified before this fix:
+  const out = bp("UBS SLASHES HUNDREDS OF JOBS DURING CREDIT SUISSE MERGER.", [], "twitter");
+  // Step 1 — classify genre.
+  assert.ok(/STEP 1[\s\S]{0,200}CLASSIFY THE GENRE/i.test(out),
+    "prompt has explicit Step 1 genre classification");
+  assert.ok(/NEWS REPORTING/.test(out) && /COMMENTARY/.test(out),
+    "prompt defines both NEWS and COMMENTARY genres");
+  // Step 2 — different thresholds.
+  assert.ok(/STEP 2[\s\S]{0,400}2\+\s*slop signals/i.test(out),
+    "Step 2 requires 2+ signals for news");
+  assert.ok(/COMMENTARY[\s\S]{0,400}1 clear slop signal/i.test(out),
+    "Step 2 requires only 1 signal for commentary");
+  // Wire-service conventions must still be called out as non-signals.
+  assert.ok(/ALL CAPS/.test(out), "ALL CAPS still called out as a non-signal");
+  assert.ok(/wire.service|news aggregator|First Squawk|Reuters/i.test(out),
+    "rule names wire-service / news-aggregator accounts");
+  assert.ok(/lacks specific|implied significance/i.test(out),
+    "rule explicitly rejects 'lacks specifics' / 'implied significance' as slop signals");
+});
+
+test("prompt distinguishes news genre from commentary genre", () => {
   const bp = loadBuildPrompt();
   const out = bp("hello world", [], "twitter");
-  // The old AUTHENTIC-only-if criteria starting with code/errors was the
-  // root of the over-fitting — ordinary commentary couldn't qualify.
-  // The new criteria should be permissive (ANY of these apply).
-  assert.ok(!/AUTHENTIC — classify as 0 ONLY if[\s\S]{0,400}code, specific error/.test(out),
-    "the old narrow 'ONLY if code/errors/specific numbers' AUTHENTIC clause is gone");
-  assert.ok(/AUTHENTIC[^\n]*ANY of these/i.test(out),
-    "new criteria are permissive (ANY) not exclusive (ONLY)");
+  // Commentary examples — "what X gets wrong about Y", "what Musk and Zuckerberg miss"
+  // should be specifically mentioned as commentary indicators.
+  assert.ok(/Musk and Zuckerberg|misses|gets wrong|the real reason|deep problem/i.test(out),
+    "prompt names commentary indicators (opinion verbs, hot-take templates)");
+  // The DEFAULT-to-authentic rule must be explicit when news + few signals.
+  assert.ok(/DEFAULT to authentic|when in doubt/i.test(out),
+    "prompt explicitly says 'default to authentic when uncertain'");
 });
 
 test("platform threads through enqueue and into the drain loop", () => {
@@ -1303,6 +1329,386 @@ test("low-confidence slop is not cached as a settled not-slop verdict", () => {
   // The low-confidence branch must NOT call cacheSetVerdict.
   assert.ok(/response\.lowConfidence[\s\S]{0,400}evaluatedWrappers\.add/.test(content),
     "low-confidence marks evaluated for session but does not cache");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 23 — Reasons-in-banner (the model explains why)
+// ════════════════════════════════════════════════════════════════════════
+suite("reasons");
+
+test("prompt asks the model for a reasons array", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  assert.ok(/"reasons":\s*\[/.test(bg), "prompt example shows reasons array");
+  assert.ok(/under 8 words/.test(bg), "prompt constrains reason length");
+});
+
+test("background parses reasons defensively (filter, trim, cap at 3)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  // Must filter non-strings, trim, cap length, slice to 3.
+  assert.ok(/parsed\.reasons[\s\S]{0,200}filter/.test(bg), "filters bad reasons");
+  assert.ok(/\.slice\(0,\s*3\)/.test(bg), "caps at 3 reasons");
+});
+
+test("background sends reasons in the verdict response", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  assert.ok(/sendResponse\(\{[^}]*reasons\s*\}\)/.test(bg) ||
+            /isSlop,\s*confidence,\s*lowConfidence,\s*reasons/.test(bg),
+    "sendResponse includes reasons");
+});
+
+test("applySlop signature accepts reasons and threads to cache", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/function applySlop\(wrapper,\s*confidence,\s*reasons/.test(content),
+    "applySlop takes reasons");
+  assert.ok(/cacheSetVerdict\(postText,\s*true,\s*confidence,\s*reasons\)/.test(content),
+    "applySlop persists reasons in the cache");
+});
+
+test("slop banner renders a reasons row when reasons are present", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/slop_dog_ear_reasons/.test(content), "reasons CSS class defined");
+  // The "Why:" prefix is what the user sees inside the banner.
+  assert.ok(/"Why:\s*"/.test(content), "banner prefixes the reasons with 'Why:'");
+  // Banner must flex-wrap so the reasons row drops below the ribbon.
+  assert.ok(/\.slop_dog_ear[\s\S]{0,400}flex-wrap:\s*wrap/.test(content),
+    "banner wraps so reasons row fits");
+});
+
+test("cache restore propagates reasons to applySlop", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Every cache-hit re-application must pass cached.reasons / verdict.reasons.
+  const cacheHitCalls = (content.match(/applySlop\(wrapper,\s*[a-z]+\.confidence,/gi) || []);
+  assert.ok(cacheHitCalls.length >= 2, "found cache-hit applySlop sites");
+  for (const call of cacheHitCalls) {
+    assert.ok(/cached\.confidence|verdict\.confidence/.test(call),
+      "each cache-hit site pulls confidence from the cached entry");
+  }
+  // And the surrounding code in those sites passes reasons.
+  assert.ok(/cached\.reasons\s*\|\|\s*\[\]/.test(content),
+    "cache hits forward cached.reasons (with [] fallback)");
+});
+
+test("revealed cards get padding-top equal to the measured banner height", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // We reverted to the padding-top approach because position:relative + flex
+  // caused X to render the banner as a left-side column. The banner stays
+  // position:absolute and we push content down with padding on the wrapper.
+  // Fallback must accommodate the two-line banner (ribbon + reasons).
+  const fallbacks = [...content.matchAll(/padding-top:\s*var\(--sr-banner-h,\s*(\d+)px\)/g)]
+    .map(m => parseInt(m[1], 10));
+  assert.ok(fallbacks.length >= 1, "at least one padding-top rule uses --sr-banner-h");
+  for (const px of fallbacks) {
+    assert.ok(px >= 80, `--sr-banner-h fallback ${px}px is too small for two-line banner`);
+  }
+});
+
+test("revealed banner stays position:absolute (don't regress to flex column on X)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Locking in the fix for the X "left-side column" bug. The banner MUST
+  // remain position:absolute when revealed — making it relative or flex
+  // causes X's flex-row tweet layout to treat it as a sibling column.
+  assert.ok(/data-sr-revealed[\s\S]{0,400}\.slop_dog_ear[\s\S]{0,400}position:\s*absolute/.test(content),
+    "revealed banner stays position:absolute");
+});
+
+test("banner height is measured live for accurate padding-top and blur cover", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Live measurement uses ResizeObserver — needed because the reasons row
+  // can wrap on narrow viewports and web fonts settle after first paint.
+  assert.ok(/ResizeObserver[\s\S]{0,200}observe\(banner\)/.test(content),
+    "ResizeObserver observes the banner");
+});
+
+test("all four platform classes are covered by the reveal padding rule", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  for (const cls of ["slop_radar_card", "slop_radar_twitter", "slop_radar_linkedin", "slop_radar_universal", "slop_radar_reddit", "slop_radar_threads"]) {
+    assert.ok(new RegExp(`\\[data-sr-revealed\\]\\.${cls}`).test(content),
+      `[data-sr-revealed].${cls} has padding-top rule`);
+  }
+});
+
+test("placeholder-echo reasons are detected as degraded output", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const bg = fs.readFileSync(path.join(findExtDir(), "background.js"), "utf8");
+  // A wedged model sometimes echoes the JSON schema's placeholder values
+  // back as the "reasons" array (e.g. "short reason 1"). We must catch this
+  // and treat it like any other degraded output so the recovery path fires.
+  assert.ok(/short reason\\s\*\\d\+\$/.test(bg) || /short reason\s*\\d/.test(bg),
+    "placeholder regex matches the schema example phrases");
+  // The detection must set degraded=true so the existing recovery flow runs.
+  assert.ok(/placeholderEcho[\s\S]{0,200}degraded\s*=\s*true/.test(bg),
+    "placeholder echo flips degraded=true");
+  // The prompt's schema example should be neutral filler the model is less
+  // tempted to copy verbatim — not phrases that look like real reasons.
+  assert.ok(!/reasons":\s*\["short reason 1"/.test(bg),
+    "prompt schema example no longer uses 'short reason N' placeholders");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 24 — Verdict cache persistence + GC
+// ════════════════════════════════════════════════════════════════════════
+// The reload experience depends on the verdict cache surviving across
+// sessions. These tests guard the structural pieces: storage key, debounced
+// writes, age-based pruning, cap eviction by ts, restore-before-sweep.
+suite("persistence");
+
+test("verdict cache uses chrome.storage.local with a stable key", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/VERDICT_STORAGE_KEY\s*=\s*["']srVerdictCache["']/.test(content),
+    "storage key constant defined");
+  assert.ok(/chrome\.storage\.local\.set\(\{\s*\[VERDICT_STORAGE_KEY\]/.test(content),
+    "persistVerdictCache writes to chrome.storage.local under that key");
+  assert.ok(/chrome\.storage\.local\.get\(\[VERDICT_STORAGE_KEY\]/.test(content),
+    "restoreVerdictCache reads the same key");
+});
+
+test("persistence has a TTL and a hard cap with reasonable defaults", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  const ttlMatch = content.match(/VERDICT_TTL_MS\s*=\s*([0-9*\s]+);/);
+  const capMatch = content.match(/VERDICT_PERSIST_CAP\s*=\s*(\d+)/);
+  assert.ok(ttlMatch, "VERDICT_TTL_MS defined");
+  assert.ok(capMatch, "VERDICT_PERSIST_CAP defined");
+  const ttl = eval(ttlMatch[1]); // numeric expression like "7 * 24 * 60 * 60 * 1000"
+  const cap = parseInt(capMatch[1], 10);
+  // Sanity: TTL between 1 hour and 30 days; cap between 200 and 10000.
+  assert.ok(ttl >= 3600_000 && ttl <= 30 * 86400_000,
+    `TTL ${ttl}ms outside the 1h-30d range`);
+  assert.ok(cap >= 200 && cap <= 10000, `cap ${cap} outside 200-10000`);
+});
+
+test("writes are debounced (no thrash on bursty scroll)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/PERSIST_DEBOUNCE_MS/.test(content), "debounce constant defined");
+  assert.ok(/function schedulePersist/.test(content), "schedulePersist exists");
+  // schedulePersist must early-return if a timer is already pending.
+  assert.ok(/schedulePersist[\s\S]{0,200}if\s*\(\s*persistTimer\s*\)\s*return/.test(content),
+    "schedulePersist coalesces concurrent calls");
+  // cacheSetVerdict must trigger a persist.
+  assert.ok(/cacheSetVerdict[\s\S]{0,400}schedulePersist\(\)/.test(content),
+    "every write schedules a persist");
+});
+
+test("gcCache prunes expired entries and enforces the cap by ts", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/function gcCache/.test(content), "gcCache defined");
+  // Prune by ts < cutoff.
+  assert.ok(/gcCache[\s\S]{0,400}ts\s*<\s*cutoff/.test(content),
+    "gcCache drops entries older than TTL");
+  // Then enforce cap by sorting on ts.
+  assert.ok(/gcCache[\s\S]{0,600}sort\([\s\S]{0,80}ts/.test(content),
+    "gcCache enforces cap by oldest ts");
+});
+
+test("restoreVerdictCache runs before the first sweep on bootstrap", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // The bootstrap must call restoreVerdictCache and start sweeping inside
+  // the callback — otherwise we race the first sweep and reclassify
+  // already-known posts.
+  assert.ok(/restoreVerdictCache\(\(\)\s*=>\s*\{[\s\S]{0,100}startSweeping\(\)/.test(content),
+    "startSweeping runs inside restoreVerdictCache callback");
+});
+
+test("opportunistic flush on tab close and visibility-hidden", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/beforeunload[\s\S]{0,200}persistVerdictCache/.test(content),
+    "flushes on beforeunload");
+  assert.ok(/visibilitychange[\s\S]{0,200}persistVerdictCache/.test(content),
+    "flushes when tab becomes hidden");
+});
+
+test("restored entries past their TTL are skipped on load", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // restoreVerdictCache must filter v.ts < cutoff when loading.
+  assert.ok(/restoreVerdictCache[\s\S]{0,500}ts\s*<\s*cutoff[\s\S]{0,80}continue/.test(content),
+    "restore skips entries past their TTL");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 25 — Promoted / Ad detector
+// ════════════════════════════════════════════════════════════════════════
+// Sponsored posts get short-circuited as slop before any AI inference. The
+// detection is purely structural — looking for a short "Promoted" / "Ad"
+// label in the post header — so it must avoid false-positives on post body
+// text that happens to contain those words.
+suite("promoted-detector");
+
+// Pull isPromotedPost out of content.js and run it against jsdom fixtures.
+function loadPromotedDetector(platform) {
+  const fs = require("fs");
+  const path = require("path");
+  const src = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Extract PROMOTED_LABELS const + isPromotedPost function.
+  const labelsMatch = src.match(/const PROMOTED_LABELS = \[[\s\S]*?\];/);
+  const fnMatch = src.match(/function isPromotedPost\(wrapper\) \{[\s\S]*?\n\}\n/);
+  assert.ok(labelsMatch && fnMatch, "extracted detector source");
+  // Build a sandboxed version that reads IS_TWITTER / IS_LINKEDIN from
+  // injected scope rather than module-level constants.
+  return new Function(
+    "IS_TWITTER", "IS_LINKEDIN",
+    labelsMatch[0] + "\n" + fnMatch[0] + "\nreturn isPromotedPost;"
+  )(platform === "twitter", platform === "linkedin");
+}
+
+test("LinkedIn: 'Promoted' label in actor description detected", () => {
+  const dom = new JSDOM(`<div data-urn="urn:li:activity:promo1">
+    <div class="update-components-actor__description">
+      <span>Acme Corp</span>
+      <span>Promoted</span>
+    </div>
+    <div class="update-components-text">Buy our product! Best in class. Trusted by 10,000 companies.</div>
+  </div>`);
+  const detect = loadPromotedDetector("linkedin");
+  const wrapper = dom.window.document.querySelector('[data-urn]');
+  assert.ok(detect(wrapper), "must detect Promoted label");
+});
+
+test("LinkedIn: post body containing the word 'promoted' is NOT a false positive", () => {
+  const dom = new JSDOM(`<div data-urn="urn:li:activity:body1">
+    <div class="update-components-actor__description">
+      <span>Jane Doe</span>
+      <span>Senior Engineer at Foo Co · 2nd</span>
+    </div>
+    <div class="update-components-text">She was promoted to VP last week — congrats!</div>
+  </div>`);
+  const detect = loadPromotedDetector("linkedin");
+  const wrapper = dom.window.document.querySelector('[data-urn]');
+  assert.equal(detect(wrapper), false, "body text 'promoted' should not match");
+});
+
+test("LinkedIn: organic post with no Promoted label is not flagged", () => {
+  const dom = new JSDOM(`<div data-urn="urn:li:activity:org1">
+    <div class="update-components-actor__description">
+      <span>Jane Doe</span>
+      <span>Senior Engineer at Foo Co · 2nd · 1h</span>
+    </div>
+    <div class="update-components-text">Excited to announce we shipped feature X.</div>
+  </div>`);
+  const detect = loadPromotedDetector("linkedin");
+  const wrapper = dom.window.document.querySelector('[data-urn]');
+  assert.equal(detect(wrapper), false, "organic post must not be flagged");
+});
+
+test("X: 'Ad' label in User-Name header detected", () => {
+  const dom = new JSDOM(`<article data-testid="tweet">
+    <div data-testid="User-Name">
+      <span>Acme Brand</span>
+      <span>@acmebrand</span>
+      <span>·</span>
+      <span>Ad</span>
+    </div>
+    <div data-testid="tweetText">Check out our new product</div>
+  </article>`);
+  const detect = loadPromotedDetector("twitter");
+  const wrapper = dom.window.document.querySelector('article');
+  assert.ok(detect(wrapper), "must detect Ad label");
+});
+
+test("X: organic tweet with timestamp '4m' but no Ad label is not flagged", () => {
+  const dom = new JSDOM(`<article data-testid="tweet">
+    <div data-testid="User-Name">
+      <span>First Squawk</span>
+      <span>@FirstSquawk</span>
+      <span>·</span>
+      <span>4m</span>
+    </div>
+    <div data-testid="tweetText">UBS slashes hundreds of jobs.</div>
+  </article>`);
+  const detect = loadPromotedDetector("twitter");
+  const wrapper = dom.window.document.querySelector('article');
+  assert.equal(detect(wrapper), false, "organic tweet must not be flagged");
+});
+
+test("X: tweet body containing the word 'ad' (e.g. 'advertise') is NOT a false positive", () => {
+  const dom = new JSDOM(`<article data-testid="tweet">
+    <div data-testid="User-Name">
+      <span>Jane Doe</span>
+      <span>@janed</span>
+      <span>·</span>
+      <span>2h</span>
+    </div>
+    <div data-testid="tweetText">Why does every ad on TV look the same these days?</div>
+  </article>`);
+  const detect = loadPromotedDetector("twitter");
+  const wrapper = dom.window.document.querySelector('article');
+  assert.equal(detect(wrapper), false, "body text mentioning 'ad' must not match");
+});
+
+test("LinkedIn: 'Gesponsert' (German) is detected for localized feeds", () => {
+  const dom = new JSDOM(`<div data-urn="urn:li:activity:de">
+    <div class="update-components-actor__description">
+      <span>Acme GmbH</span>
+      <span>Gesponsert</span>
+    </div>
+    <div class="update-components-text">Unsere neue Produktreihe</div>
+  </div>`);
+  const detect = loadPromotedDetector("linkedin");
+  const wrapper = dom.window.document.querySelector('[data-urn]');
+  assert.ok(detect(wrapper), "must detect German 'Gesponsert' label");
+});
+
+test("enqueueNode short-circuits promoted posts to applySlop, skipping the AI queue", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // enqueueNode must call isPromotedPost and, when true, invoke applySlop
+  // with confidence 100 and return BEFORE adding the node to the queue.
+  assert.ok(/isPromotedPost\(wrapper\)[\s\S]{0,200}applySlop\(wrapper,\s*100/.test(content),
+    "promoted detection short-circuits to applySlop(wrapper, 100, ...)");
+  assert.ok(/isPromotedPost\(wrapper\)[\s\S]{0,400}\n\s*return;/.test(content),
+    "promoted branch returns before queueing");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 26 — LinkedIn sweep cadence
+// ════════════════════════════════════════════════════════════════════════
+suite("linkedin-cadence");
+
+test("LinkedIn sweep cadence is not slower than ~1 second", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Old value was 1200ms which made the queue feel sluggish. We bumped it
+  // to be closer to X's cadence (700ms) so the in-viewport posts populate
+  // in roughly the same time on both platforms.
+  const m = content.match(/SWEEP_INTERVAL_MS\s*=\s*IS_LINKEDIN\s*\?\s*(\d+)/);
+  assert.ok(m, "found SWEEP_INTERVAL_MS for LinkedIn");
+  const ms = parseInt(m[1], 10);
+  assert.ok(ms <= 1000, `LinkedIn cadence ${ms}ms is too slow (target ≤1000)`);
 });
 
 

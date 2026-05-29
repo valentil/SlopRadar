@@ -164,7 +164,7 @@ function markRightClickedAsSlop(selectionText) {
   // 1. Remove / mark the element immediately (don't wait for the model).
   if (wrapper) {
     resetWrapper(wrapper);
-    applySlop(wrapper, 95); // user said it's slop — high confidence
+    applySlop(wrapper, 95, ["user marked as slop"]); // user override — high confidence
     srLog(`right-click: marked post as slop — "${postText.substring(0, 50)}…"`);
   }
 
@@ -257,14 +257,20 @@ function cacheGetVerdict(text) {
   return v || null;
 }
 
-function cacheSetVerdict(text, isSlop, confidence) {
+function cacheSetVerdict(text, isSlop, confidence, reasons) {
   const key = hashPostText(text);
-  verdictCache.set(key, { isSlop, confidence, ts: Date.now() });
+  verdictCache.set(key, {
+    isSlop,
+    confidence,
+    reasons: Array.isArray(reasons) ? reasons : [],
+    ts: Date.now(),
+  });
   // Evict oldest if over cap
   if (verdictCache.size > VERDICT_CACHE_MAX) {
     const oldest = verdictCache.keys().next().value;
     verdictCache.delete(oldest);
   }
+  schedulePersist();
 }
 
 // ── Viewport-priority queue ───────────────────────────────────────────────
@@ -274,6 +280,93 @@ const evaluatedWrappers = new WeakSet();
 const nodeTextSnapshot = new WeakMap(); // textNode → last seen text (recycle detection)
 let currentQueueSize = 0;
 
+// ── Verdict cache persistence ─────────────────────────────────────────────
+// The in-memory `verdictCache` evaporates when the tab closes. We persist
+// it to chrome.storage.local so a reload doesn't have to reclassify every
+// post in the feed — on startup we restore the Map and re-apply known
+// verdicts immediately, then only new posts hit the AI.
+//
+// Layout in storage:
+//   { srVerdictCache: { [hashKey]: { isSlop, confidence, reasons, ts } } }
+//
+// GC strategy:
+//   • Drop entries older than VERDICT_TTL_MS on every persist.
+//   • If still over cap after age-pruning, drop oldest by ts until under.
+//   • Debounce writes (5s coalescing) — applying verdicts in bursts during
+//     scroll shouldn't thrash storage.
+const VERDICT_STORAGE_KEY = "srVerdictCache";
+const VERDICT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const VERDICT_PERSIST_CAP = 2000;               // hard ceiling in storage
+const PERSIST_DEBOUNCE_MS = 5000;
+
+let persistTimer = null;
+let cacheRestored = false;
+
+function schedulePersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(persistVerdictCache, PERSIST_DEBOUNCE_MS);
+}
+
+function gcCache() {
+  const cutoff = Date.now() - VERDICT_TTL_MS;
+  // Drop expired entries first.
+  for (const [k, v] of verdictCache) {
+    if (!v || (v.ts && v.ts < cutoff)) verdictCache.delete(k);
+  }
+  // Then enforce the cap by ts (oldest first). Map preserves insertion order
+  // but we want true oldest-by-ts in case entries were restored out of order.
+  if (verdictCache.size > VERDICT_PERSIST_CAP) {
+    const sorted = [...verdictCache.entries()]
+      .sort((a, b) => (a[1].ts || 0) - (b[1].ts || 0));
+    const drop = sorted.slice(0, verdictCache.size - VERDICT_PERSIST_CAP);
+    for (const [k] of drop) verdictCache.delete(k);
+  }
+}
+
+function persistVerdictCache() {
+  persistTimer = null;
+  if (!chrome?.storage?.local) return;
+  gcCache();
+  // Convert Map → plain object for storage. Each entry stays tiny
+  // (few-byte hash key + small JSON value).
+  const obj = {};
+  for (const [k, v] of verdictCache) obj[k] = v;
+  try {
+    chrome.storage.local.set({ [VERDICT_STORAGE_KEY]: obj });
+  } catch (_) {}
+}
+
+// Flush opportunistically — when the tab is closing or hidden, write
+// anything we have so a reload picks up the very latest verdicts.
+window.addEventListener("beforeunload", () => {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  persistVerdictCache();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") persistVerdictCache();
+});
+
+// Load any persisted verdicts into the in-memory cache on startup.
+function restoreVerdictCache(cb) {
+  if (!chrome?.storage?.local) { cacheRestored = true; cb?.(); return; }
+  chrome.storage.local.get([VERDICT_STORAGE_KEY], (data) => {
+    if (chrome.runtime.lastError) { cacheRestored = true; cb?.(); return; }
+    const obj = data[VERDICT_STORAGE_KEY] || {};
+    const cutoff = Date.now() - VERDICT_TTL_MS;
+    let loaded = 0;
+    for (const [k, v] of Object.entries(obj)) {
+      if (!v || typeof v !== "object") continue;
+      if (v.ts && v.ts < cutoff) continue;       // skip expired on load
+      verdictCache.set(k, v);
+      loaded++;
+    }
+    cacheRestored = true;
+    if (loaded > 0) srLog(`restored ${loaded} cached verdict(s) from storage`);
+    cb?.();
+  });
+}
+
+// ── Viewport scoring ──────────────────────────────────────────────────────
 function viewportScore(el) {
   try {
     const rect = el.getBoundingClientRect();
@@ -320,7 +413,7 @@ slopStyle.textContent = `
     position: absolute !important;
     top: 0 !important; left: 0 !important; right: 0 !important;
     background: var(--sr-red) !important;
-    display: flex !important; align-items: center !important; gap: 10px !important;
+    display: flex !important; flex-wrap: wrap !important; align-items: center !important; gap: 10px !important;
     padding: 8px 14px !important;
     z-index: 99999 !important; pointer-events: none !important;
     box-shadow: 0 2px 12px rgba(224,36,36,0.35) !important;
@@ -347,6 +440,18 @@ slopStyle.textContent = `
   .slop_dog_ear_ribbon .sr-sub {
     color: rgba(255,255,255,0.75) !important; font-size: 0.7rem !important;
     font-weight: 600 !important; white-space: nowrap !important;
+  }
+  /* "Why this is slop" — short list of model reasons. Spans the banner
+     under the ribbon so it stays visible while the post body is blurred. */
+  .slop_dog_ear_reasons {
+    flex-basis: 100% !important;
+    color: rgba(255,255,255,0.92) !important;
+    font-size: 0.68rem !important; font-weight: 500 !important;
+    line-height: 1.35 !important;
+    padding: 4px 2px 0 2px !important;
+    border-top: 1px solid rgba(255,255,255,0.2) !important;
+    margin-top: 4px !important;
+    user-select: text !important;
   }
   .sr_blur_cover {
     position: absolute !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
@@ -383,18 +488,35 @@ slopStyle.textContent = `
     cursor: default !important;
   }
 
-  /* Figure-1 fix: when a slop card is revealed via "Show anyway", the
-     absolutely-positioned banner would otherwise overlap the first line of
-     the post. Pad the top of the revealed card by the banner height so the
-     content drops down clear of the controls. The --sr-banner-h variable is
-     set per-card in JS from the measured banner height. */
-  .slop_radar_card[data-sr-revealed] {
-    padding-top: var(--sr-banner-h, 44px) !important;
+  /* When a slop card is revealed via "Show anyway", the banner needs to sit
+     as a full-width bar at the top of the card with the post content below
+     it. On LinkedIn the article is display:block so padding-top works. On X,
+     the <article data-testid="tweet"> is display:flex flex-direction:row —
+     padding-top on a flex container is a NO-OP relative to its children's
+     positions. So we explicitly force display:block on the revealed wrapper.
+     This sacrifices X's internal flex layout but the avatar+content stack
+     naturally as block elements below the banner anyway. */
+  [data-sr-revealed].slop_radar_card,
+  [data-sr-revealed].slop_radar_twitter,
+  [data-sr-revealed].slop_radar_linkedin,
+  [data-sr-revealed].slop_radar_universal,
+  [data-sr-revealed].slop_radar_reddit,
+  [data-sr-revealed].slop_radar_threads {
+    padding-top: var(--sr-banner-h, 96px) !important;
+    transition: padding-top 0.15s ease-out !important;
+    display: block !important;
   }
-  /* Twitter cards: the banner overlays the top, so revealed tweets also
-     need the same nudge. */
-  .slop_radar_twitter[data-sr-revealed] {
-    padding-top: var(--sr-banner-h, 44px) !important;
+  /* Keep the banner ABSOLUTE in the revealed state — it overlays the top of
+     the card and the padding-top above makes room for it. The banner stays
+     in its own absolute box and doesn't participate in the article's flex. */
+  [data-sr-revealed] > .slop_dog_ear,
+  [data-sr-revealed] .slop_dog_ear:first-child {
+    position: absolute !important;
+    top: 0 !important; left: 0 !important; right: 0 !important;
+    width: auto !important;
+    display: flex !important;
+    flex-basis: auto !important;
+    order: 0 !important;
   }
 
   /* LinkedIn/universal/reddit/threads collapse */
@@ -799,7 +921,7 @@ function showSitePauseBanner() {
 }
 
 // ── Apply SLOP ────────────────────────────────────────────────────────────
-function applySlop(wrapper, confidence, fromCache = false) {
+function applySlop(wrapper, confidence, reasons = [], fromCache = false) {
   if (evaluatedWrappers.has(wrapper)) return;
   if (wrapper.querySelector(".slop_dog_ear")) return;
   wrapper.querySelector(".not_slop_dog_ear")?.remove();
@@ -807,7 +929,7 @@ function applySlop(wrapper, confidence, fromCache = false) {
 
   evaluatedWrappers.add(wrapper);
   const postText = wrapper.textContent?.trim().substring(0, 800) || "";
-  cacheSetVerdict(postText, true, confidence);
+  cacheSetVerdict(postText, true, confidence, reasons);
 
   if (!fromCache) recordResult(true);
 
@@ -846,7 +968,7 @@ function applySlop(wrapper, confidence, fromCache = false) {
     wrapper.style.setProperty("overflow", "hidden", "important");
   }
 
-  // ── Mode 3: normal — banner with controls ──────────────────────────────
+  // ── Mode 3: normal — banner with controls and reasons ──────────────────
   const banner = document.createElement("div");
   banner.className = "slop_dog_ear";
 
@@ -908,24 +1030,63 @@ function applySlop(wrapper, confidence, fromCache = false) {
   }
 
   banner.append(ribbon, controls);
+
+  // Reasons row — short list of WHY the model flagged this post. Sits below
+  // the ribbon, inside the banner. Stays clear even when the card is blurred
+  // (the banner is above the blur cover).
+  if (reasons && reasons.length > 0) {
+    const reasonsEl = document.createElement("div");
+    reasonsEl.className = "slop_dog_ear_reasons";
+    reasonsEl.textContent = "Why: " + reasons.join(" · ");
+    banner.appendChild(reasonsEl);
+  }
+
   wrapper.insertBefore(banner, wrapper.firstChild);
 
-  // Measure the banner and expose its height as a CSS variable so the
-  // "revealed" padding-top matches exactly — gives the controls room to
-  // breathe instead of overlapping the first line of the post.
-  requestAnimationFrame(() => {
-    const h = banner.offsetHeight || 44;
-    wrapper.style.setProperty("--sr-banner-h", h + "px");
-  });
+  // Measure the banner's height and expose it as a CSS variable so the
+  // "revealed" padding-top matches exactly — gives the post content room to
+  // breathe below the banner instead of overlapping it. We do this LIVE via
+  // ResizeObserver because:
+  //  • the reasons row can wrap to multiple lines on narrow viewports
+  //  • LinkedIn/X rewrite the card's inner content, which can re-flow the
+  //    banner's siblings and change wrap behavior
+  //  • the very first offsetHeight read can be too early if web fonts are
+  //    still loading; a follow-up tick is needed
+  // The observer is cheap (one element) and disconnects when the wrapper
+  // is GC'd along with the banner.
+  const syncBannerHeight = () => {
+    const h = banner.offsetHeight;
+    if (h > 0) {
+      // Add a small visual buffer so the first line of revealed content has
+      // breathing room below the banner, not flush against it.
+      wrapper.style.setProperty("--sr-banner-h", (h + 6) + "px");
+    }
+  };
+  requestAnimationFrame(syncBannerHeight);
+  // Once more after fonts settle — Space Mono / DM Sans may not have been
+  // applied on the first rAF.
+  setTimeout(syncBannerHeight, 120);
+  if (typeof ResizeObserver !== "undefined") {
+    try {
+      const ro = new ResizeObserver(syncBannerHeight);
+      ro.observe(banner);
+    } catch (_) {}
+  }
 
   // Blur cover (non-hide mode only)
   if (!settings.hideSlop) {
     const blurCover = document.createElement("div");
     blurCover.className = "sr_blur_cover";
     wrapper.appendChild(blurCover);
-    requestAnimationFrame(() => {
-      blurCover.style.top = (banner.offsetHeight || 40) + "px";
-    });
+    const syncBlurTop = () => {
+      const h = banner.offsetHeight;
+      if (h > 0) blurCover.style.top = h + "px";
+    };
+    requestAnimationFrame(syncBlurTop);
+    setTimeout(syncBlurTop, 120);
+    if (typeof ResizeObserver !== "undefined") {
+      try { new ResizeObserver(syncBlurTop).observe(banner); } catch (_) {}
+    }
   }
 }
 
@@ -1061,7 +1222,7 @@ async function drainOne() {
   // ── Cache hit — keyed on post text, survives X back-navigation ──────────
   const cached = cacheGetVerdict(rawText);
   if (cached) {
-    if (cached.isSlop) applySlop(wrapper, cached.confidence, true);
+    if (cached.isSlop) applySlop(wrapper, cached.confidence, cached.reasons || [], true);
     else applyNotSlop(wrapper, cached.confidence, false, true);
     requestAnimationFrame(drainOne);
     return;
@@ -1121,8 +1282,9 @@ async function drainOne() {
       }
 
       const confidence = response.confidence ?? 70;
+      const reasons = Array.isArray(response.reasons) ? response.reasons : [];
       if (response.isSlop) {
-        applySlop(wrapper, confidence);
+        applySlop(wrapper, confidence, reasons);
       } else if (response.lowConfidence) {
         // Slop suspected but below the user's confidence bar — show it
         // normally but do NOT cache as a settled not-slop verdict, so it
@@ -1146,6 +1308,78 @@ function scheduleDrain() {
 }
 
 // ── Enqueue ───────────────────────────────────────────────────────────────
+// ── Promoted / Ad detector ────────────────────────────────────────────────
+// LinkedIn marks promoted posts with the literal text "Promoted" inside the
+// post header (a small label next to or below the actor name). X marks ads
+// with "Ad" in the same role. We detect these structurally so we can hide
+// them WITHOUT spending an AI inference — they're slop by definition (paid
+// placement, not content). Reasons row makes it clear why they're flagged.
+//
+// Detection is intentionally conservative:
+//   - The label must be a SHORT standalone element (≤ 12 chars).
+//   - It must be inside the post's header area, not in the body text.
+//   - We match the exact strings LinkedIn/X use plus a few common
+//     localizations ("Promu", "Anuncio") for non-English feeds.
+const PROMOTED_LABELS = [
+  "Promoted",        // LinkedIn EN
+  "Promu",           // LinkedIn FR
+  "Promocionado",    // LinkedIn ES (some surfaces)
+  "Gesponsert",      // LinkedIn DE
+  "Sponsored",       // Generic
+  "Ad",              // X
+  "Anuncio",         // X ES
+  "Werbung",         // X DE
+];
+function isPromotedPost(wrapper) {
+  if (!wrapper) return false;
+  // Fast path: look for very small text nodes inside the wrapper containing
+  // one of the label strings, near the top of the card. We scope to header
+  // candidates rather than searching the whole post — a post body that
+  // happens to say "Promoted by his peers" must NOT match.
+  // X: aria-labelledby on the article often lists element IDs; the testid
+  // "tweet" wrappers use a span with role="presentation" for the Ad label.
+  if (IS_TWITTER) {
+    // The promoted indicator on X sits inside the user-name header as a
+    // sibling of the timestamp. Look for short standalone "Ad" text.
+    const header = wrapper.querySelector('[data-testid="User-Name"]');
+    if (header) {
+      const spans = header.querySelectorAll("span");
+      for (const s of spans) {
+        const t = (s.textContent || "").trim();
+        if (t.length <= 12 && PROMOTED_LABELS.includes(t)) return true;
+      }
+    }
+    return false;
+  }
+  if (IS_LINKEDIN) {
+    // LinkedIn puts "Promoted" inside the actor description area, usually
+    // as a span sibling of the connection-degree text. Restrict to the
+    // first ~250 chars of the card markup to avoid body false-positives.
+    // We use a structural check: a span/div whose ENTIRE text is exactly
+    // one of the labels.
+    const candidates = wrapper.querySelectorAll(
+      ".update-components-actor__description span, " +
+      ".update-components-actor__sub-description span, " +
+      ".update-components-actor__sub-description, " +
+      "[class*='actor__description'] span, " +
+      "[class*='actor__sub-description'] span"
+    );
+    for (const c of candidates) {
+      const t = (c.textContent || "").trim();
+      if (t.length <= 12 && PROMOTED_LABELS.includes(t)) return true;
+    }
+    // Fallback: a top-level visually-hidden label LinkedIn sometimes uses.
+    // ".visually-hidden" inside actor area with text "Promoted".
+    const hidden = wrapper.querySelector('.visually-hidden, [class*="visually-hidden"]');
+    if (hidden) {
+      const t = (hidden.textContent || "").trim();
+      if (t.length <= 12 && PROMOTED_LABELS.includes(t)) return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 function enqueueNode(textNode) {
   if (isComposerOrInput(textNode)) return;
   const rawText = (textNode.textContent || "").trim();
@@ -1162,6 +1396,19 @@ function enqueueNode(textNode) {
 
   const wrapper = getPostWrapper(textNode);
   if (!wrapper || isComposerOrInput(wrapper)) return;
+
+  // Promoted / Ad short-circuit: structurally detected paid placements get
+  // marked as slop immediately, no AI call. Saves inference time, gives the
+  // user a clear reason in the banner, and makes the filter consistent
+  // regardless of how the model would have classified the ad copy.
+  if (!evaluatedWrappers.has(wrapper) && isPromotedPost(wrapper)) {
+    applySlop(wrapper, 100, [
+      IS_TWITTER ? "promoted post (X ad)" : "promoted post (LinkedIn ad)",
+    ]);
+    targetedTextNodes.add(textNode);
+    nodeTextSnapshot.set(textNode, rawText);
+    return;
+  }
 
   // If the wrapper was already stamped but now holds different text,
   // it was recycled too — clear its marks so we re-evaluate.
@@ -1186,7 +1433,7 @@ function enqueueNode(textNode) {
           // Re-stamp: clear evaluated state and re-apply the known verdict.
           evaluatedWrappers.delete(wrapper);
           resetWrapper(wrapper);
-          if (verdict.isSlop) applySlop(wrapper, verdict.confidence, true);
+          if (verdict.isSlop) applySlop(wrapper, verdict.confidence, verdict.reasons || [], true);
           else applyNotSlop(wrapper, verdict.confidence, true, true);
           srLog(`re-applied ${verdict.isSlop ? "SLOP" : "ok"} block — ` +
             `LinkedIn had wiped it`);
@@ -1237,7 +1484,7 @@ function reapplyAllSlopCards() {
     const cached = cacheGetVerdict(txt);
     resetWrapper(wrapper);
     if (cached && cached.isSlop) {
-      applySlop(wrapper, cached.confidence, true); // fromCache: no stat double-count
+      applySlop(wrapper, cached.confidence, cached.reasons || [], true);
       n++;
     }
   });
@@ -1276,7 +1523,12 @@ function queueContainerCheck(node) {
 // whole feed each pass, so recycled nodes get picked up.
 
 let sweepTimer = null;
-const SWEEP_INTERVAL_MS = IS_LINKEDIN ? 1200 : 700; // gentler cadence on LinkedIn
+// Sweep cadence per platform. LinkedIn used to be at 1200ms (too conservative)
+// which made the queue feel slow on heavy feeds — bumping it closer to X's
+// 700ms keeps the in-viewport posts populating quickly without thrashing.
+// Scroll events also trigger out-of-cadence sweeps via scrollSweepThrottle,
+// so this is more of a "background refresh" than a hard upper bound.
+const SWEEP_INTERVAL_MS = IS_LINKEDIN ? 800 : 700;
 
 // Set to true to get verbose per-sweep diagnostics in the console.
 const SR_DEBUG = true;
@@ -1517,5 +1769,11 @@ loadSettings(() => {
       `Detection may be less precise than on LinkedIn/X.`);
   }
 
-  startSweeping();
+  // Restore the persisted verdict cache BEFORE the first sweep — otherwise
+  // posts already classified in a previous session would all hit the AI
+  // again instead of using their cached verdict. The sweep starts inside
+  // the callback so we never race.
+  restoreVerdictCache(() => {
+    startSweeping();
+  });
 });

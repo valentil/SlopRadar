@@ -269,27 +269,52 @@ function buildPromptPreview(text, pats, platform) {
 
   return `You are a careful detector of AI-generated marketing slop and engagement bait on social media. Classify as slop (1) or authentic (0).
 
-SLOP PATTERNS — classify as 1 if ANY of these are present:
+STEP 1 — CLASSIFY THE GENRE FIRST:
+Before considering slop, decide which genre this post belongs to:
+
+  (A) NEWS REPORTING — a post stating that a named event, statement, action, or announcement HAPPENED, involving real people, institutions, countries, companies, or markets. The author is reporting what occurred, not editorializing about it. Signals: named entity + action verb + specific event. Example: "UBS slashes jobs during Credit Suisse merger." "Netanyahu announces troop movement." "Fed's Paulson says consumers are spending." ALL CAPS, terse, breaking-news style — these are wire-service conventions, NOT slop signals.
+
+  (B) COMMENTARY / OPINION — a post where the main point is the AUTHOR'S take, framing, or interpretation rather than a real event. Often: "what X gets wrong about Y", "the deep problem with Z", "here's what Musk and Zuckerberg miss", uses the news as a springboard for the author's hot take. Signals: opinion verbs ("misses", "gets wrong", "doesn't realize", "the real reason"), value-laden framing, no clear new event being reported.
+
+  (C) OTHER — neither news nor commentary (jokes, replies, questions, conversations, product posts, etc.)
+
+STEP 2 — APPLY DIFFERENT SLOP THRESHOLDS BY GENRE:
+The bar for "slop" depends on the genre. A news report needs MULTIPLE slop signals to be flagged; commentary can be flagged on a single clear signal.
+
+  (A) NEWS REPORTING — require 2+ slop signals from the pattern list. A single weakly-matching pattern is NOT enough. If in doubt, classify as authentic (0). Genuine wire-service news with no real engagement-bait structure is ALWAYS authentic.
+
+  (B) COMMENTARY / OPINION — require 1 clear slop signal. Commentary is where engagement bait usually lives, so be more willing to flag. Templates like "here's the deep problem with X", "what they don't tell you about Y", "the real reason Z failed" are slop with high confidence.
+
+  (C) OTHER — require 1 clear slop signal, but use length-aware judgment (see LENGTH NOTE).
+
+SLOP PATTERNS (signals to count):
 ${patternList}
 
-AUTHENTIC (0) — a post is authentic if ANY of these apply:
-- It reports on or discusses real-world news, events, policy, markets, sports, or politics — even with strong opinions or framing. Confident commentary about real events is not slop.
-- It contains specific details: code, error messages, real numbers, named entities, dates, or first-hand experience with concrete particulars.
-- It's a genuine question, joke, reaction, or short opinion without engagement-bait structure.
-- It makes a narrow, falsifiable claim with supporting evidence.
+AUTHENTIC (0) — DEFAULT to authentic when:
+- The post is news reporting and has fewer than 2 clear slop signals.
+- The post reports a named event, statement, or action by a real entity.
+- The post contains specific details: code, error messages, real numbers, named entities, dates, or first-hand experience.
+- The post is a genuine question, joke, reaction, or short opinion without engagement-bait structure.
+- You are uncertain — when in doubt, choose 0.
 
 DO NOT classify as slop just because:
+- The headline is in ALL CAPS or terse wire-service style.
+- The post names an institution, official, country, or market without elaboration.
 - The author writes confidently or with strong framing.
 - The post is about a current event or politically charged topic.
-- The author is a public figure, official, journalist, or pundit.
-- The post is short (see LENGTH NOTE).${platformGuidance}${lengthGuidance}
+- The author is a public figure, official, journalist, or news aggregator.
+- The post is short (see LENGTH NOTE).
+- The post "lacks specific data points" or "implied significance" — those are normal features of news, NOT slop signals.${platformGuidance}${lengthGuidance}
 
 Input Text:
 """
 ${text || "(paste a post above to preview)"}
 """
 
-Respond with ONLY a JSON object like {"slop": 1, "confidence": 87}. No other text.`;
+Respond with ONLY a JSON object: {"slop": 1, "confidence": 87, "reasons": ["...", "..."]}.
+- "reasons" is an array of 1-3 SHORT phrases (each under 8 words) explaining WHY the post triggered as slop. Each phrase MUST describe something specific about THIS post — never copy or paraphrase the schema example above. Good examples for slop posts: "vague 'this image' framing", "engagement-bait opener", "no specific claims".
+- For authentic posts (slop: 0), "reasons" may be empty [].
+- No markdown, no preamble, no explanation outside the JSON.`;
 }
 
 function renderPromptInspector() {
