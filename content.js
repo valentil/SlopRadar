@@ -28,7 +28,7 @@ const MIN_POST_CHARS = 20;
 // ── Settings ──────────────────────────────────────────────────────────────
 let settings = {
   darkMode: false, showTrashCan: true,
-  minConfidence: 90, hideSlop: false,
+  minConfidence: 80, hideSlop: false,
   excludedSites: [], // user-added hostnames to skip even among supported sites
   showTrainingButtons: true, // show "Confirm slop" / "Not slop" training buttons
   nonIntrusiveMode: false,    // hide slop quietly — no banners, no training UI
@@ -107,7 +107,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "pauseSiteSession") {
     sessionPausedSites.add(PAGE_HOSTNAME);
     pendingNodes.length = 0;
-    draining = false;
+    inFlightDrains = 0;
     showSitePauseBanner();
   }
   if (request.action === "markRightClickedAsSlop") {
@@ -257,12 +257,18 @@ function cacheGetVerdict(text) {
   return v || null;
 }
 
-function cacheSetVerdict(text, isSlop, confidence, reasons) {
+function cacheSetVerdict(text, isSlop, confidence, reasons, belowThreshold) {
   const key = hashPostText(text);
   verdictCache.set(key, {
     isSlop,
     confidence,
     reasons: Array.isArray(reasons) ? reasons : [],
+    // True when isSlop=true but confidence is below the user's threshold
+    // at classification time. The cache hit path checks this against the
+    // CURRENT threshold to decide whether to actually paint the banner.
+    // Lets a user dial the threshold down and have prior verdicts kick in
+    // without needing to re-AI everything.
+    belowThreshold: !!belowThreshold,
     ts: Date.now(),
   });
   // Evict oldest if over cap
@@ -275,7 +281,11 @@ function cacheSetVerdict(text, isSlop, confidence, reasons) {
 
 // ── Viewport-priority queue ───────────────────────────────────────────────
 let pendingNodes = [];
-const targetedTextNodes = new Set();
+// WeakSet so we don't permanently retain every text node we've ever seen —
+// the platform recycles these aggressively and we don't need them after the
+// node is removed from the DOM. (Was a regular Set previously, which leaked
+// references to dead text nodes across the whole session.)
+const targetedTextNodes = new WeakSet();
 const evaluatedWrappers = new WeakSet();
 const nodeTextSnapshot = new WeakMap(); // textNode → last seen text (recycle detection)
 let currentQueueSize = 0;
@@ -294,7 +304,13 @@ let currentQueueSize = 0;
 //   • If still over cap after age-pruning, drop oldest by ts until under.
 //   • Debounce writes (5s coalescing) — applying verdicts in bursts during
 //     scroll shouldn't thrash storage.
-const VERDICT_STORAGE_KEY = "srVerdictCache";
+// v2: write/read keys are now hashes of the BODY text only, not the whole
+// wrapper text (which included avatar/timestamp/engagement-counts and made
+// every lookup miss). The old "srVerdictCache" key is left in storage and
+// will be cleaned up the next time someone uses the chrome.storage quota,
+// but we don't try to migrate entries — they were keyed under a completely
+// different hash function input and aren't usable.
+const VERDICT_STORAGE_KEY = "srVerdictCache_v2";
 const VERDICT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const VERDICT_PERSIST_CAP = 2000;               // hard ceiling in storage
 const PERSIST_DEBOUNCE_MS = 5000;
@@ -343,14 +359,36 @@ window.addEventListener("beforeunload", () => {
   persistVerdictCache();
 });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") persistVerdictCache();
+  if (document.visibilityState === "hidden") {
+    persistVerdictCache();
+    return;
+  }
+  // Visible again. Two things may have gone stale while we were hidden:
+  // (1) X's SPA navigation tore down articles we had in-flight, leaving
+  //     pipeline slots blocked on callbacks that may never fire. The
+  //     drain watchdog will eventually clear them, but we can also kick
+  //     pumpDrain now — if there's queue work and pipeline capacity, it
+  //     runs immediately.
+  // (2) Sweeps fire on a timer even when hidden, but X often holds back
+  //     DOM updates for backgrounded tabs and the visible feed has new
+  //     posts the next sweep should pick up. Force one immediately.
+  if (!isPaused && !isSitePaused()) {
+    safeSweep();
+    pumpDrain();
+  }
 });
 
 // Load any persisted verdicts into the in-memory cache on startup.
 function restoreVerdictCache(cb) {
   if (!chrome?.storage?.local) { cacheRestored = true; cb?.(); return; }
-  chrome.storage.local.get([VERDICT_STORAGE_KEY], (data) => {
+  chrome.storage.local.get([VERDICT_STORAGE_KEY, "srVerdictCache"], (data) => {
     if (chrome.runtime.lastError) { cacheRestored = true; cb?.(); return; }
+    // Opportunistic cleanup: drop the stale v1 cache key (entries hashed
+    // under the old wrapper-text key scheme that never matches the new
+    // body-text lookup). Fire-and-forget; we don't block on it.
+    if (data.srVerdictCache) {
+      try { chrome.storage.local.remove("srVerdictCache"); } catch (_) {}
+    }
     const obj = data[VERDICT_STORAGE_KEY] || {};
     const cutoff = Date.now() - VERDICT_TTL_MS;
     let loaded = 0;
@@ -488,27 +526,36 @@ slopStyle.textContent = `
     cursor: default !important;
   }
 
-  /* When a slop card is revealed via "Show anyway", the banner needs to sit
-     as a full-width bar at the top of the card with the post content below
-     it. On LinkedIn the article is display:block so padding-top works. On X,
-     the <article data-testid="tweet"> is display:flex flex-direction:row —
-     padding-top on a flex container is a NO-OP relative to its children's
-     positions. So we explicitly force display:block on the revealed wrapper.
-     This sacrifices X's internal flex layout but the avatar+content stack
-     naturally as block elements below the banner anyway. */
-  [data-sr-revealed].slop_radar_card,
-  [data-sr-revealed].slop_radar_twitter,
-  [data-sr-revealed].slop_radar_linkedin,
-  [data-sr-revealed].slop_radar_universal,
-  [data-sr-revealed].slop_radar_reddit,
-  [data-sr-revealed].slop_radar_threads {
-    padding-top: var(--sr-banner-h, 96px) !important;
-    transition: padding-top 0.15s ease-out !important;
-    display: block !important;
+  /* When revealed: the banner stays position:absolute at top:0 of the
+     wrapper. To make room for it without breaking X's flex-row layout
+     (where padding-top on the article gets ignored relative to its
+     children's positioning), we inject a spacer DIV as the article's
+     first child. The spacer's height equals --sr-banner-h, kept in sync
+     by ResizeObserver on the banner.
+
+     If the wrapper is a flex container (X's tweet article), we force
+     flex-wrap:wrap so the spacer claims its own row above the avatar
+     and content. The spacer's flex-basis:100% then makes it take the
+     entire row width. On block-layout wrappers (LinkedIn, Reddit) the
+     spacer is just a block element that takes its natural row. */
+  [data-sr-revealed] {
+    flex-wrap: wrap !important;
   }
-  /* Keep the banner ABSOLUTE in the revealed state — it overlays the top of
-     the card and the padding-top above makes room for it. The banner stays
-     in its own absolute box and doesn't participate in the article's flex. */
+  [data-sr-revealed] > .sr_reveal_spacer {
+    display: block !important;
+    width: 100% !important;
+    flex-basis: 100% !important;
+    flex-shrink: 0 !important;
+    height: var(--sr-banner-h, 96px) !important;
+    order: -1 !important;             /* claim the topmost row in flex */
+    transition: height 0.15s ease-out !important;
+  }
+  /* When not revealed, the spacer is irrelevant. */
+  :not([data-sr-revealed]) > .sr_reveal_spacer {
+    display: none !important;
+  }
+  /* Banner stays absolute regardless of revealed state — it overlays
+     either the spacer (revealed) or the blurred card (collapsed). */
   [data-sr-revealed] > .slop_dog_ear,
   [data-sr-revealed] .slop_dog_ear:first-child {
     position: absolute !important;
@@ -921,6 +968,44 @@ function showSitePauseBanner() {
 }
 
 // ── Apply SLOP ────────────────────────────────────────────────────────────
+// Pull the canonical "post body" text from a wrapper — the same text that
+// the sweep would extract from the post's text-node child. This MUST match
+// what enqueueNode hashes for cache lookup, otherwise the write and read
+// keys diverge and the cache appears to have 0% hit rate even with hundreds
+// of entries (the bug that broke reload-restore).
+//
+// The wrapper.textContent shortcut concatenates EVERYTHING — avatar names,
+// timestamps, engagement counts, suggested replies — which produces a
+// completely different hash than the bare body text. We instead query the
+// platform-specific body selector and use its trimmed text, falling back
+// to the wrapper text if no body selector matches.
+function getCanonicalPostText(wrapper) {
+  if (!wrapper) return "";
+  // Use the SAME selector logic as getTextSelectors() but scoped to the
+  // wrapper. Take the first matching node — there's exactly one body per
+  // post on the platforms we support.
+  let bodyEl = null;
+  if (IS_TWITTER) {
+    bodyEl = wrapper.querySelector('[data-testid="tweetText"]');
+  } else if (IS_LINKEDIN) {
+    bodyEl = wrapper.querySelector(
+      '[data-testid="expandable-text-box"], ' +
+      '.update-components-text, ' +
+      '.feed-shared-update-v2__description-wrapper, ' +
+      '.feed-shared-inline-show-more-text'
+    );
+  } else if (IS_REDDIT) {
+    bodyEl = wrapper.querySelector(
+      '[data-testid="post-content"] [property="schema:articleBody"], ' +
+      'shreddit-post [slot="text-body"], [data-click-id="text"], .md'
+    );
+  } else if (IS_THREADS) {
+    bodyEl = wrapper.querySelector('span[dir="auto"]');
+  }
+  const text = (bodyEl?.textContent || wrapper.textContent || "").trim();
+  return text.substring(0, 800);
+}
+
 function applySlop(wrapper, confidence, reasons = [], fromCache = false) {
   if (evaluatedWrappers.has(wrapper)) return;
   if (wrapper.querySelector(".slop_dog_ear")) return;
@@ -928,7 +1013,7 @@ function applySlop(wrapper, confidence, reasons = [], fromCache = false) {
   wrapper.querySelector(".not_slop_tw_wrap")?.remove();
 
   evaluatedWrappers.add(wrapper);
-  const postText = wrapper.textContent?.trim().substring(0, 800) || "";
+  const postText = getCanonicalPostText(wrapper);
   cacheSetVerdict(postText, true, confidence, reasons);
 
   if (!fromCache) recordResult(true);
@@ -1041,6 +1126,22 @@ function applySlop(wrapper, confidence, reasons = [], fromCache = false) {
     banner.appendChild(reasonsEl);
   }
 
+  // Insert a spacer FIRST, then the banner before the spacer. Result order:
+  //   <wrapper>
+  //     <banner>          (position:absolute, top:0)
+  //     <spacer>          (height:--sr-banner-h when revealed, display:none otherwise)
+  //     ...original content...
+  //   </wrapper>
+  // The spacer participates in whatever layout X has set up — flex row,
+  // grid, block — and pushes everything else down by --sr-banner-h when
+  // the card is revealed. The banner overlays the spacer area visually.
+  // This avoids fighting X's layout: we don't have to change the article's
+  // display mode or apply padding-top (which X's flex-row makes a no-op).
+  wrapper.querySelector(".sr_reveal_spacer")?.remove();
+  const spacer = document.createElement("div");
+  spacer.className = "sr_reveal_spacer";
+  spacer.setAttribute("aria-hidden", "true");
+  wrapper.insertBefore(spacer, wrapper.firstChild);
   wrapper.insertBefore(banner, wrapper.firstChild);
 
   // Measure the banner's height and expose it as a CSS variable so the
@@ -1096,7 +1197,7 @@ function applyNotSlop(wrapper, confidence, force = false, fromCache = false) {
   if (wrapper.getAttribute("data-slop-detected") === "true") return;
 
   evaluatedWrappers.add(wrapper);
-  const postText = wrapper.textContent?.trim().substring(0, 800) || "";
+  const postText = getCanonicalPostText(wrapper);
   cacheSetVerdict(postText, false, confidence);
   wrapper.dataset.srStampedText = postText.substring(0, 120);
 
@@ -1199,24 +1300,217 @@ function getTextSelectors() {
 }
 
 // ── Drain loop ────────────────────────────────────────────────────────────
-let draining = false;
+let inFlightDrains = 0;
+// Pipeline up to this many post evaluations into the background at once.
+// The single shared AI session still processes them serially, but the
+// network round-trip / MV3 wake-up overhead of post N+1 overlaps with the
+// inference for post N. Cap is small because the model is the bottleneck
+// and we don't want stale work piling up if a tab is about to navigate.
+const PIPELINE_MAX = 3;
+// In-flight text-hash dedup. X (and LinkedIn) sometimes render the same
+// post text in multiple wrappers — quote tweets, "you might have missed"
+// re-renders, conversation threads — and each wrapper sees an enqueue.
+// Without dedup, we burn AI calls re-classifying the same string.
+// Maps hashKey → array of pending {wrapper, textNode} waiting for the
+// in-flight verdict to come back. When it does, ALL waiters get applied.
+const inFlightByText = new Map();
 let swFailureStreak = 0; // consecutive service-worker failures
 
-async function drainOne() {
-  if (isPaused || isSitePaused() || pendingNodes.length === 0) { draining = false; return; }
-  draining = true;
+// ── Perf instrumentation ──────────────────────────────────────────────────
+// Track where time goes so we can answer "why isn't my queue filling up?"
+//
+//   cacheHits / cacheMisses        — how often we skip the AI entirely
+//   totalAgeMs                     — sum of (drainStart - enqueuedAt) so we
+//                                    can report the AVERAGE time a post sits
+//                                    in the queue before classification starts
+//   aiCalls / totalAiMs / maxAiMs  — round-trip time to the background AI
+//                                    (covers sendMessage + LanguageModel.prompt)
+//
+// Logged every 15 seconds via flushPerfStats() so the Logs tab shows
+// throughput without flooding the console on bursty scrolls.
+const perfStats = {
+  cacheHits: 0, cacheMisses: 0,
+  totalAgeMs: 0,
+  aiCalls: 0, totalAiMs: 0, maxAiMs: 0,
+  sweepCount: 0, sweepMatchedTotal: 0, sweepEnqueuedTotal: 0,
+  lastFlushAt: Date.now(),
+};
+
+function flushPerfStats() {
+  const s = perfStats;
+  const elapsed = Math.max(1, (Date.now() - s.lastFlushAt) / 1000);
+  const handled = s.cacheHits + s.cacheMisses;
+  // ALWAYS log a perf line so the user can see the system is alive even when
+  // idle (steady-state of a static viewport produces 0 posts/15s but the
+  // sweeps are still running). The "idle" wording makes the state clear.
+  if (handled === 0 && s.aiCalls === 0 && s.sweepCount === 0) {
+    srLog(`perf: idle (no sweeps or work in last ${elapsed.toFixed(1)}s)`);
+    s.lastFlushAt = Date.now();
+    return;
+  }
+  const cacheRate = handled ? Math.round((s.cacheHits / handled) * 100) : 0;
+  const avgAge = handled ? Math.round(s.totalAgeMs / handled) : 0;
+  const avgAi = s.aiCalls ? Math.round(s.totalAiMs / s.aiCalls) : 0;
+  const tps = (handled / elapsed).toFixed(2);
+  srLog(
+    `perf: ${handled} posts in ${elapsed.toFixed(1)}s (${tps}/s) | ` +
+    `cache ${cacheRate}% (${s.cacheHits} hit / ${s.cacheMisses} miss) | ` +
+    `queue-age avg ${avgAge}ms | ` +
+    `AI avg ${avgAi}ms max ${Math.round(s.maxAiMs)}ms over ${s.aiCalls} calls | ` +
+    `sweeps ${s.sweepCount} matched ${s.sweepMatchedTotal} enq ${s.sweepEnqueuedTotal} | ` +
+    `pending ${pendingNodes.length} pipe ${inFlightDrains}/${PIPELINE_MAX}` +
+    (swFailureStreak > 0 ? ` | ⚠ AI failure streak ${swFailureStreak}` : "")
+  );
+  // Reset window counters; keep maxAiMs across windows for tail visibility.
+  s.cacheHits = 0; s.cacheMisses = 0;
+  s.totalAgeMs = 0;
+  s.aiCalls = 0; s.totalAiMs = 0;
+  s.sweepCount = 0; s.sweepMatchedTotal = 0; s.sweepEnqueuedTotal = 0;
+  s.lastFlushAt = Date.now();
+}
+setInterval(flushPerfStats, 15000);
+
+// Pipelined drain. The single AI session in the background is still serial,
+// but pipelining lets us overlap the message round-trip / MV3 wake-up of
+// post N+1 with the inference for post N. Also makes the queue VISIBLE in
+// the popup: instead of insta-shifting one item at a time, multiple items
+// stay in flight, which is what the user expects to see.
+// Tracks the last time we successfully kicked a drain. If pumpDrain is
+// called but inFlightDrains == PIPELINE_MAX (pipeline is "full") for an
+// extended period despite pending work, we log a diagnostic.
+let lastPumpFiredAt = Date.now();
+let lastStuckWarnAt = 0;
+
+function pumpDrain() {
+  if (isPaused || isSitePaused()) return;
+  // Start up to PIPELINE_MAX concurrent drains. Each drain handles ONE item
+  // and self-decrements when it completes (sync, cache hit) or its callback
+  // returns (async, AI call).
+  let kicked = 0;
+  while (inFlightDrains < PIPELINE_MAX && pendingNodes.length > 0) {
+    inFlightDrains++;
+    kicked++;
+    queueMicrotask(drainOne);
+  }
+  if (kicked > 0) lastPumpFiredAt = Date.now();
+
+  // Stuck-pipeline diagnostic: if the pipeline is at cap AND there's pending
+  // work AND we haven't fired a new drain in a while, something is sitting
+  // on the slots without finishing. The watchdog should free them at +30s,
+  // but if it doesn't (e.g. the tab was backgrounded and timers throttled),
+  // at least the user can see in the logs that we're aware.
+  if (inFlightDrains >= PIPELINE_MAX && pendingNodes.length > 0) {
+    const stuckMs = Date.now() - lastPumpFiredAt;
+    const since = Date.now() - lastStuckWarnAt;
+    if (stuckMs > 15000 && since > 15000) {
+      srLog(
+        `⚠ pipeline stuck for ${Math.round(stuckMs / 1000)}s ` +
+        `(inFlight=${inFlightDrains}/${PIPELINE_MAX}, pending=${pendingNodes.length}). ` +
+        `Drain watchdogs at ${DRAIN_MAX_AGE_MS}ms should release them. ` +
+        `If this persists, the AI session is likely wedged — try Restart Engine.`
+      );
+      lastStuckWarnAt = Date.now();
+    }
+  }
+}
+
+// Wall-clock cap on a single in-flight drain. AI inferences have been
+// observed at 6-10s in real X usage, but if a callback genuinely never
+// fires (MV3 worker died mid-request, tab navigated, etc.) the pipeline
+// slot would leak forever. 30s is well beyond the slowest healthy
+// inference we've measured, and guarantees the slot will free up.
+const DRAIN_MAX_AGE_MS = 30000;
+
+function drainOne() {
+  if (isPaused || isSitePaused() || pendingNodes.length === 0) {
+    inFlightDrains = Math.max(0, inFlightDrains - 1);
+    return;
+  }
 
   const item = pendingNodes.shift();
   currentQueueSize = pendingNodes.length;
   const { textNode, wrapper } = item;
+  const tDrainStart = performance.now();
+
+  // Idempotent finish — defends against double-calls (callback fires AND
+  // the watchdog timer fires) which would otherwise double-decrement
+  // inFlightDrains and let pumpDrain start MORE work than PIPELINE_MAX.
+  let finished = false;
+  let watchdog = null;
+  // The drainOneInner code sets this when it dispatches an AI call so the
+  // watchdog (in this outer scope) can clean up the in-flight text map if
+  // the callback never fires. Stays null for cache hits / promoted hits
+  // that don't open an in-flight entry.
+  let inFlightKey = null;
+  const finish = (reason) => {
+    if (finished) return;
+    finished = true;
+    if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+    // If we set an in-flight entry but never delivered a verdict to its
+    // waiters (e.g. watchdog fired before the callback came back), clear
+    // it now so the next sweep can re-dispatch. Waiters are left orphaned
+    // here — the next sweep that finds their text will re-enqueue them,
+    // and they'll either hit the cache (if a parallel dispatch succeeded)
+    // or be the new originator. We don't try to immediately re-queue
+    // waiters because the watchdog path already re-queues the originator;
+    // the sweep will re-find the waiters' wrappers naturally.
+    if (inFlightKey && inFlightByText.has(inFlightKey)) {
+      const orphaned = inFlightByText.get(inFlightKey);
+      inFlightByText.delete(inFlightKey);
+      if (orphaned.length > 0) {
+        srLog(`drain ${reason || "ok"} — clearing ${orphaned.length} orphaned waiter${orphaned.length>1?"s":""} (next sweep will re-find them)`);
+      }
+    }
+    inFlightDrains = Math.max(0, inFlightDrains - 1);
+    if (reason && reason !== "ok") srLog(`drain finished via ${reason} (in-flight now ${inFlightDrains})`);
+    pumpDrain();
+  };
+
+  // Hard timeout: if NOTHING calls finish() within DRAIN_MAX_AGE_MS we
+  // force-release the pipeline slot. The only way a pipeline gets stuck
+  // is a sendMessage callback that never fires — this is the failsafe.
+  // We also re-queue the item if it's still in the DOM so it gets retried
+  // once the pipeline is healthy again.
+  watchdog = setTimeout(() => {
+    if (finished) return;
+    srLog(`⚠ drain watchdog fired — slot was stuck ${DRAIN_MAX_AGE_MS}ms ` +
+      `(likely lost callback). Forcing release.`);
+    if (document.contains(wrapper) && !evaluatedWrappers.has(wrapper)) {
+      try { targetedTextNodes.delete(textNode); } catch (_) {}
+      pendingNodes.push({ textNode, wrapper, enqueuedAt: performance.now() });
+    }
+    finish("watchdog");
+  }, DRAIN_MAX_AGE_MS);
+
+  // Belt-and-suspenders: any synchronous exception in the drain body would
+  // skip past finish() and leak the pipeline slot. The watchdog catches
+  // that 30s later, but we want it to release immediately so the user
+  // doesn't sit watching a frozen feed. try/finally guarantees finish()
+  // runs if we exit synchronously without scheduling sendMessage.
+  try {
+    drainOneInner(item, finish, (k) => { inFlightKey = k; });
+  } catch (err) {
+    srLog(`⚠ drain exception: ${err?.message || err}. Releasing slot.`);
+    finish("exception");
+  }
+}
+
+// Body of the drain. Separated so we can wrap drainOne's setup (counter
+// management, watchdog, finish closure) around it in a try/catch without
+// nesting the logic visually. `setInFlightKey` lets the inner body report
+// which text-hash it claimed in inFlightByText, so the watchdog can clean
+// it up if the callback never fires.
+function drainOneInner(item, finish, setInFlightKey) {
+  const { textNode, wrapper } = item;
+  const tDrainStart = performance.now();
 
   if (evaluatedWrappers.has(wrapper) || !document.contains(wrapper)) {
-    requestAnimationFrame(drainOne); return;
+    finish(); return;
   }
 
   const rawText = (textNode.textContent || "").trim();
   if (rawText.length < MIN_POST_CHARS) {
-    requestAnimationFrame(drainOne); return;
+    finish(); return;
   }
 
   // ── Cache hit — keyed on post text, survives X back-navigation ──────────
@@ -1224,15 +1518,44 @@ async function drainOne() {
   if (cached) {
     if (cached.isSlop) applySlop(wrapper, cached.confidence, cached.reasons || [], true);
     else applyNotSlop(wrapper, cached.confidence, false, true);
-    requestAnimationFrame(drainOne);
+    perfStats.cacheHits++;
+    if (item.enqueuedAt) perfStats.totalAgeMs += (tDrainStart - item.enqueuedAt);
+    finish();
     return;
   }
+  perfStats.cacheMisses++;
+  if (item.enqueuedAt) perfStats.totalAgeMs += (tDrainStart - item.enqueuedAt);
 
-  srLog(`Q:${pendingNodes.length} "${rawText.substring(0,60)}…"`);
+  // In-flight dedup: if the same post text is already in flight, attach
+  // this wrapper as a waiter and finish() the slot. When the original
+  // verdict returns, all waiters get the result applied. Saves AI calls
+  // for X's "same tweet rendered in 3 places" pattern.
+  const textKey = hashPostText(rawText);
+  if (inFlightByText.has(textKey)) {
+    inFlightByText.get(textKey).push({ wrapper, textNode });
+    srLog(`⇉waiting (same text already in flight) "${rawText.substring(0,50)}…"`);
+    finish();
+    return;
+  }
+  inFlightByText.set(textKey, []);
+  setInFlightKey(textKey);
 
+  srLog(`→AI dispatch (pending:${pendingNodes.length} pipe:${inFlightDrains}/${PIPELINE_MAX}) "${rawText.substring(0,50)}…"`);
+
+  const tAiStart = performance.now();
   chrome.runtime.sendMessage(
     { action: "evaluatePost", text: rawText.substring(0, 1500), tabId: MY_TAB_ID, platform: PLATFORM },
     (response) => {
+      const dt = performance.now() - tAiStart;
+      perfStats.aiCalls++;
+      perfStats.totalAiMs += dt;
+      if (dt > perfStats.maxAiMs) perfStats.maxAiMs = dt;
+
+      // Pull the waiter list now; we'll deliver to them after we determine
+      // the verdict shape. Always clear the in-flight entry, even on
+      // failure, so subsequent enqueues of the same text retry.
+      const waiters = inFlightByText.get(textKey) || [];
+      inFlightByText.delete(textKey);
       // ── Service worker / model failure handling ────────────────────────
       // Two failure shapes, both must NOT be stamped:
       //  • empty/undefined response → MV3 worker asleep or dropped the message
@@ -1249,23 +1572,32 @@ async function drainOne() {
 
       if (failed) {
         swFailureStreak++;
-        // Re-queue this node at the back so it retries later.
-        if (document.contains(wrapper) && !evaluatedWrappers.has(wrapper)) {
-          targetedTextNodes.delete(textNode); // allow re-enqueue
-          pendingNodes.push({ textNode, wrapper });
-        }
+        // Re-queue this node at the back so it retries later. Also re-queue
+        // any waiters that piled up — they were riding on this verdict; if
+        // it failed, they need their own retry. (Without this, X's
+        // multi-rendered tweets would silently drop after one failure.)
+        const requeue = (w, tn) => {
+          if (!w || !tn) return;
+          if (document.contains(w) && !evaluatedWrappers.has(w)) {
+            try { targetedTextNodes.delete(tn); } catch (_) {}
+            pendingNodes.push({ textNode: tn, wrapper: w, enqueuedAt: performance.now() });
+          }
+        };
+        requeue(wrapper, textNode);
+        for (const w of waiters) requeue(w.wrapper, w.textNode);
         if (swFailureStreak === 1 || swFailureStreak % 10 === 0) {
           const why = response?.degraded ? "model returned degraded output — kickstarting"
             : (chrome.runtime.lastError?.message || "empty response");
           srLog(
             `⚠ classification unavailable ` +
-            `(streak ${swFailureStreak}) — re-queued post, will retry. ${why}`
+            `(streak ${swFailureStreak}) — re-queued post${waiters.length>0?` +${waiters.length} waiter${waiters.length>1?"s":""}`:""}, will retry. ${why}`
           );
         }
         // Back off so we don't hammer a dead/recovering worker. Cap higher
         // for degraded streaks since session recreation takes a moment.
-        setTimeout(() => requestAnimationFrame(drainOne),
-          Math.min(4000, 200 * swFailureStreak));
+        // finish() refills the pipeline immediately; the backoff applies to
+        // the NEXT pump rather than blocking this drain slot.
+        setTimeout(finish, Math.min(4000, 200 * swFailureStreak));
         return;
       }
 
@@ -1277,34 +1609,51 @@ async function drainOne() {
       // just move on. (On a hard reload this content script is already gone;
       // this guard matters for SPA navigation within the same document.)
       if (response.stale) {
-        requestAnimationFrame(drainOne);
+        finish();
         return;
       }
 
       const confidence = response.confidence ?? 70;
       const reasons = Array.isArray(response.reasons) ? response.reasons : [];
-      if (response.isSlop) {
-        applySlop(wrapper, confidence, reasons);
-      } else if (response.lowConfidence) {
-        // Slop suspected but below the user's confidence bar — show it
-        // normally but do NOT cache as a settled not-slop verdict, so it
-        // gets re-evaluated if the threshold changes. We mark the wrapper
-        // evaluated for this session only (no cache write).
-        evaluatedWrappers.add(wrapper);
-        wrapper.dataset.srStampedText = (textNode.textContent || "").trim().substring(0, 120);
-      } else {
-        applyNotSlop(wrapper, confidence);
-      }
-      requestAnimationFrame(drainOne);
+      const verdictStr = response.isSlop ? `SLOP ${confidence}%` :
+                         response.lowConfidence ? `low-conf ${confidence}%` :
+                         `ok ${confidence}%`;
+      const waitersNote = waiters.length > 0 ? ` (+${waiters.length} waiter${waiters.length>1?"s":""})` : "";
+      srLog(`→AI ${Math.round(dt)}ms ${verdictStr} "${rawText.substring(0, 50)}…"${waitersNote}`);
+
+      // Helper to apply the same verdict to one (wrapper, textNode) pair.
+      // Used for the originator AND for every waiter that piled up while
+      // this inference was running. applySlop / applyNotSlop are safe to
+      // call on already-evaluated wrappers (they early-return).
+      const applyTo = (w, tn) => {
+        if (!w || !document.contains(w)) return;
+        if (response.isSlop) {
+          applySlop(w, confidence, reasons);
+        } else if (response.lowConfidence) {
+          // Slop suspected but below the user's confidence bar. Don't paint
+          // the banner, but DO cache the verdict (with a low-conf flag) so
+          // the next sweep doesn't re-classify the same post. If the user
+          // later lowers the threshold, the cache layer can re-evaluate
+          // from the stored confidence without a fresh AI call.
+          evaluatedWrappers.add(w);
+          if (tn) w.dataset.srStampedText = (tn.textContent || "").trim().substring(0, 120);
+          // Cache as slop=true with the original confidence + a flag so
+          // future code (e.g. threshold-change handlers) can find these.
+          cacheSetVerdict(rawText, true, confidence, reasons, true /*belowThreshold*/);
+        } else {
+          applyNotSlop(w, confidence);
+        }
+      };
+      applyTo(wrapper, textNode);
+      for (const w of waiters) applyTo(w.wrapper, w.textNode);
+      finish();
     }
   );
 }
 
 function scheduleDrain() {
-  if (!draining && !isPaused && !isSitePaused() && pendingNodes.length > 0) {
-    draining = true;
-    requestAnimationFrame(drainOne);
-  }
+  if (isPaused || isSitePaused()) return;
+  pumpDrain();
 }
 
 // ── Enqueue ───────────────────────────────────────────────────────────────
@@ -1380,34 +1729,137 @@ function isPromotedPost(wrapper) {
   return false;
 }
 
+// When a sweep re-encounters a post we already classified, check whether
+// the visible UI (banner / blur / NOT-SLOP tag) is still in place. The
+// platform's own DOM-rewriting may have wiped what we injected even though
+// our state still thinks the wrapper is "evaluated." If so, re-apply from
+// the cached verdict — no AI call needed. Returns true if it re-applied.
+//
+// This is the dup-recovery path: dups shouldn't be silently dropped if
+// they need their badge re-painted.
+function maybeReapplyFromCache(wrapper, rawText) {
+  const verdict = cacheGetVerdict(rawText);
+  if (!verdict) return false;
+
+  if (verdict.isSlop) {
+    // For slop: the banner is the primary visible mark. If it's missing
+    // AND we're not in hide-mode AND not display:none'd (remove-entirely),
+    // the card is just sitting there un-flagged. Re-stamp.
+    const hideModeApplied = wrapper.classList.contains("sr_hide_mode");
+    const removedEntirely = wrapper.style.display === "none";
+    const bannerMissing = !wrapper.querySelector(".slop_dog_ear");
+    if (bannerMissing && !hideModeApplied && !removedEntirely) {
+      // Treat as recycle — clear stale eval state, then re-paint from cache.
+      evaluatedWrappers.delete(wrapper);
+      resetWrapper(wrapper);
+      applySlop(wrapper, verdict.confidence, verdict.reasons || [], true);
+      srLog(`re-applied SLOP block — platform DOM rewrite had wiped it`);
+      return true;
+    }
+  } else {
+    // For NOT-SLOP: the green badge being missing is purely cosmetic and
+    // platforms (especially LinkedIn) thrash that area aggressively. Only
+    // re-apply if the trash-can button is enabled AND the badge is gone —
+    // otherwise we'd churn re-injecting badges every sweep.
+    const tagMissing = !wrapper.querySelector(".not_slop_dog_ear") &&
+                       !wrapper.querySelector(".not_slop_tw_wrap");
+    if (tagMissing && settings.showTrashCan) {
+      evaluatedWrappers.delete(wrapper);
+      // Don't resetWrapper here — leave the wrapper's other state alone,
+      // we just need the tag back. applyNotSlop is idempotent enough.
+      applyNotSlop(wrapper, verdict.confidence, true, true);
+      return true;
+    }
+  }
+  return false;
+}
+
 function enqueueNode(textNode) {
   if (isComposerOrInput(textNode)) return;
   const rawText = (textNode.textContent || "").trim();
   if (rawText.length < MIN_POST_CHARS) return;
 
-  // Dedup — but handle recycled nodes (X reuses <article> elements as you
-  // scroll; the same DOM node ends up holding a different tweet). If the
-  // text changed, treat it as a fresh node.
-  if (targetedTextNodes.has(textNode)) {
-    const lastText = nodeTextSnapshot.get(textNode);
-    if (lastText === rawText) return;          // genuinely unchanged
-    targetedTextNodes.delete(textNode);        // recycled — allow re-eval
-  }
-
+  // Resolve the wrapper EARLY — needed for cache-hit application and the
+  // dup-recovery branch below.
   const wrapper = getPostWrapper(textNode);
   if (!wrapper || isComposerOrInput(wrapper)) return;
+
+  // ── Synchronous cache hit ───────────────────────────────────────────────
+  // Look up the verdict by hashed post text FIRST, before any other work.
+  // If we have a cached verdict and the wrapper hasn't been stamped yet,
+  // paint it immediately without going through the AI queue. This is what
+  // makes a page reload "feel instant": every post whose text we've seen
+  // before gets its banner/badge back in the same tick the sweep finds it.
+  //
+  // We deliberately don't depend on text-node identity (X recycles those)
+  // or wrapper identity (div names change every render). The cache key is
+  // a hash of the trimmed post text — that's the only thing stable across
+  // reloads and DOM rewrites.
+  if (!evaluatedWrappers.has(wrapper)) {
+    const cached = cacheGetVerdict(rawText);
+    if (cached) {
+      perfStats.cacheHits++;
+      // The paint decision for a cached slop verdict is ALWAYS:
+      // "does the stored confidence clear the user's CURRENT threshold?"
+      // This way the threshold is the single source of truth — works
+      // whether the verdict was originally classified as above-threshold
+      // (e.g. 96% when threshold was 80) and the user later raised the
+      // bar to 99, or was suppressed below threshold (the belowThreshold
+      // case) and the user later lowered it. Either way, the cached
+      // confidence + the current threshold determine the outcome.
+      const threshold = settings.minConfidence ?? 80;
+      const meetsThreshold = cached.isSlop && cached.confidence >= threshold;
+      if (meetsThreshold) {
+        const note = cached.belowThreshold ? " (promoted from low-conf)" : "";
+        srLog(`✓cache SLOP ${cached.confidence}%${note} "${rawText.substring(0, 50)}…"`);
+        applySlop(wrapper, cached.confidence, cached.reasons || [], true);
+      } else if (cached.isSlop) {
+        // Cached as slop but doesn't clear the current threshold. Treat
+        // like the in-session low-conf path: mark evaluated, no banner.
+        // Don't log on every sweep — would flood the log on long sessions.
+        evaluatedWrappers.add(wrapper);
+        wrapper.dataset.srStampedText = rawText.substring(0, 120);
+      } else {
+        srLog(`✓cache ok "${rawText.substring(0, 50)}…"`);
+        applyNotSlop(wrapper, cached.confidence, false, true);
+      }
+      targetedTextNodes.add(textNode);
+      nodeTextSnapshot.set(textNode, rawText);
+      return;
+    }
+  }
 
   // Promoted / Ad short-circuit: structurally detected paid placements get
   // marked as slop immediately, no AI call. Saves inference time, gives the
   // user a clear reason in the banner, and makes the filter consistent
   // regardless of how the model would have classified the ad copy.
-  if (!evaluatedWrappers.has(wrapper) && isPromotedPost(wrapper)) {
+  // (We check this BEFORE the dup branch — if the wrapper just had a
+  // Promoted label injected, we want to catch it even on a re-sweep.)
+  if (!wrapper.querySelector(".slop_dog_ear") && isPromotedPost(wrapper)) {
+    if (evaluatedWrappers.has(wrapper)) resetWrapper(wrapper);
+    srLog(`✓promoted "${rawText.substring(0, 50)}…"`);
     applySlop(wrapper, 100, [
       IS_TWITTER ? "promoted post (X ad)" : "promoted post (LinkedIn ad)",
     ]);
     targetedTextNodes.add(textNode);
     nodeTextSnapshot.set(textNode, rawText);
     return;
+  }
+
+  // Dedup — but handle recycled nodes (X reuses <article> elements as you
+  // scroll; the same DOM node ends up holding a different tweet). If the
+  // text changed, treat it as a fresh node.
+  if (targetedTextNodes.has(textNode)) {
+    const lastText = nodeTextSnapshot.get(textNode);
+    if (lastText === rawText) {
+      // Genuinely unchanged — but the platform may have RE-RENDERED the card
+      // since we stamped it, wiping the banner / NOT-SLOP tag we injected.
+      // If we have a cached verdict for this exact text and the visible
+      // marks are missing, re-apply silently from cache (no AI call).
+      maybeReapplyFromCache(wrapper, rawText);
+      return;
+    }
+    targetedTextNodes.delete(textNode);        // recycled — allow re-eval
   }
 
   // If the wrapper was already stamped but now holds different text,
@@ -1422,30 +1874,14 @@ function enqueueNode(textNode) {
       // banner / blur / NOT-SLOP tag we injected while leaving the wrapper
       // element itself in evaluatedWrappers. Our state says "done" but the
       // DOM is blank. Detect that and re-apply from the cached verdict.
-      const verdict = cacheGetVerdict(rawText);
-      if (verdict) {
-        const blockMissing = verdict.isSlop
-          ? !wrapper.querySelector(".slop_dog_ear") &&
-            !wrapper.classList.contains("sr_hide_mode") &&
-            wrapper.style.display !== "none"
-          : false; // NOT-SLOP tag missing is cosmetic — don't churn on it
-        if (blockMissing) {
-          // Re-stamp: clear evaluated state and re-apply the known verdict.
-          evaluatedWrappers.delete(wrapper);
-          resetWrapper(wrapper);
-          if (verdict.isSlop) applySlop(wrapper, verdict.confidence, verdict.reasons || [], true);
-          else applyNotSlop(wrapper, verdict.confidence, true, true);
-          srLog(`re-applied ${verdict.isSlop ? "SLOP" : "ok"} block — ` +
-            `LinkedIn had wiped it`);
-        }
-      }
+      maybeReapplyFromCache(wrapper, rawText);
       return;
     }
   }
 
   targetedTextNodes.add(textNode);
   nodeTextSnapshot.set(textNode, rawText);
-  pendingNodes.push({ textNode, wrapper });
+  pendingNodes.push({ textNode, wrapper, enqueuedAt: performance.now() });
 }
 
 // Remove all SlopRadar marks from a recycled wrapper so it can be re-evaluated
@@ -1461,6 +1897,7 @@ function resetWrapper(wrapper) {
     "slop_radar_twitter", "slop_radar_linkedin", "slop_radar_universal",
     "slop_radar_reddit", "slop_radar_threads");
   wrapper.querySelector(".slop_dog_ear")?.remove();
+  wrapper.querySelector(".sr_reveal_spacer")?.remove();
   wrapper.querySelector(".not_slop_dog_ear")?.remove();
   wrapper.querySelector(".not_slop_tw_wrap")?.remove();
   wrapper.querySelector(".sr_blur_cover")?.remove();
@@ -1531,7 +1968,10 @@ let sweepTimer = null;
 const SWEEP_INTERVAL_MS = IS_LINKEDIN ? 800 : 700;
 
 // Set to true to get verbose per-sweep diagnostics in the console.
-const SR_DEBUG = true;
+// When true, every sweep is logged regardless of outcome. By default we only
+// log sweeps with new work, slow sweeps, or empty-match sweeps (DOM may have
+// changed). Flip this on locally if you're debugging selector issues.
+const SR_DEBUG = false;
 
 // Deep diagnostic — runs whenever a sweep matches nothing. Tells us
 // definitively whether the DOM is empty, in an iframe, in shadow DOM,
@@ -1664,6 +2104,7 @@ function detectShadowOrFrames() {
 function sweep() {
   if (isPaused || isSitePaused()) return;
   sweepCount++;
+  const tSweepStart = performance.now();
 
   // Flat query first (cheap). If it finds nothing AND the page has shadow
   // roots or iframes, fall back to the deep query.
@@ -1692,12 +2133,34 @@ function sweep() {
     else rejectedDup++;
   });
 
-  if (SR_DEBUG) {
+  const sweepMs = performance.now() - tSweepStart;
+  perfStats.sweepCount++;
+  perfStats.sweepMatchedTotal += rawMatches.length;
+  perfStats.sweepEnqueuedTotal += found;
+
+  // Slow-sweep warning: if any single sweep takes longer than the sweep
+  // interval itself (800ms LinkedIn, 700ms X), we're falling behind and
+  // need to know. Logs immediately rather than waiting for the 15s flush.
+  if (sweepMs > SWEEP_INTERVAL_MS) {
+    srLog(`⚠ slow sweep #${sweepCount}: ${Math.round(sweepMs)}ms ` +
+      `(matched ${rawMatches.length}, enq ${found}). ` +
+      `Cadence ${SWEEP_INTERVAL_MS}ms — falling behind.`);
+  }
+
+  // Sweep logging strategy: only log when something interesting happened so
+  // the Logs tab isn't a wall of identical "matched 16 enqueued 0" lines.
+  //   • enqueued > 0   → log it (work entered the system)
+  //   • slow sweep     → log it (already handled above)
+  //   • matched 0      → log occasionally (selectors might be broken)
+  //   • SR_DEBUG       → log everything (developer mode)
+  const interesting = found > 0 || sweepMs > SWEEP_INTERVAL_MS ||
+    (rawMatches.length === 0 && Date.now() - lastProbeAt > 5000);
+  if (SR_DEBUG || interesting) {
     srLog(
-      `sweep #${sweepCount} (${PLATFORM}): ` +
-      `matched ${rawMatches.length}${usedDeep ? " [deep]" : ""} | ` +
-      `enqueued ${found} | queue ${pendingNodes.length} ` +
-      `(rej: composer ${rejectedComposer}, short ${rejectedShort}, ` +
+      `sweep #${sweepCount} ${Math.round(sweepMs)}ms | ` +
+      `matched ${rawMatches.length}${usedDeep ? "[deep]" : ""} ` +
+      `enq ${found} q ${pendingNodes.length} ` +
+      `(rej: comp ${rejectedComposer}, short ${rejectedShort}, ` +
       `noWrap ${rejectedNoWrapper}, dup ${rejectedDup})`
     );
     if (rawMatches.length === 0 && Date.now() - lastProbeAt > 5000) {

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "SlopRadar AI Filter",
   "version": "1.6",
-  "description": "Uses on-device Gemini Nano to detect and hide generic AI-generated marketing slop in your social feeds. 100% local \u2014 nothing leaves your browser.",
+  "description": "Hide AI-generated marketing slop in your social feeds. 100% on-device with Gemini Nano \u2014 nothing leaves your browser.",
   "permissions": [
     "scripting",
     "tabs",

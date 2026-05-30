@@ -144,8 +144,8 @@ function loadSettings() {
     document.getElementById("s-remove-entirely").checked = !!s.removeEntirely;
     document.getElementById("s-noninstrusive").checked = !!s.nonIntrusiveMode;
     document.getElementById("s-training-buttons").checked = s.showTrainingButtons !== false;
-    document.getElementById("s-min-conf").value = s.minConfidence ?? 90;
-    document.getElementById("s-min-conf-val").textContent = `${s.minConfidence ?? 90}%`;
+    document.getElementById("s-min-conf").value = s.minConfidence ?? 80;
+    document.getElementById("s-min-conf-val").textContent = `${s.minConfidence ?? 80}%`;
     applyDark(!!s.darkMode);
   });
 }
@@ -311,8 +311,9 @@ Input Text:
 ${text || "(paste a post above to preview)"}
 """
 
-Respond with ONLY a JSON object: {"slop": 1, "confidence": 87, "reasons": ["...", "..."]}.
-- "reasons" is an array of 1-3 SHORT phrases (each under 8 words) explaining WHY the post triggered as slop. Each phrase MUST describe something specific about THIS post — never copy or paraphrase the schema example above. Good examples for slop posts: "vague 'this image' framing", "engagement-bait opener", "no specific claims".
+Respond with ONLY a JSON object: {"slop": 1, "confidence": <integer 50-99>, "reasons": ["...", "..."]}.
+- "confidence" is YOUR certainty (integer 50-99): 95+ for obvious slop with multiple signals, 75-89 for moderate cases, 50-65 for borderline. Do NOT use the same number for every response — calibrate to the specific post. For authentic posts use 50-70 unless the post is clearly authentic with strong specific details.
+- "reasons" is an array of 1-3 SHORT phrases (each under 8 words) explaining WHY the post triggered as slop. Each phrase MUST describe something specific about THIS post. Good examples for slop posts: "vague 'this image' framing", "engagement-bait opener", "no specific claims".
 - For authentic posts (slop: 0), "reasons" may be empty [].
 - No markdown, no preamble, no explanation outside the JSON.`;
 }

@@ -916,12 +916,28 @@ test("content re-applies a wiped slop block from the verdict cache", () => {
   const path = require("path");
   const content = fs.readFileSync(
     path.join(findExtDir(), "content.js"), "utf8");
-  // enqueueNode must detect a missing banner on an evaluated wrapper and
-  // re-apply from cache rather than silently skipping it as a dup.
-  assert.ok(content.includes("blockMissing"),
-    "enqueueNode checks whether the injected block is still present");
-  assert.ok(/blockMissing[\s\S]{0,300}applySlop/.test(content),
-    "re-applies slop when the block was wiped");
+  // enqueueNode (via maybeReapplyFromCache) must detect a missing banner on
+  // a known-slop wrapper and re-apply from cache rather than silently
+  // skipping it as a dup.
+  assert.ok(/function maybeReapplyFromCache/.test(content),
+    "maybeReapplyFromCache helper exists");
+  assert.ok(/bannerMissing|blockMissing/.test(content),
+    "checks whether the injected banner is still present");
+  assert.ok(/maybeReapplyFromCache[\s\S]{0,2000}applySlop\(wrapper,\s*verdict\.confidence/.test(content),
+    "re-applies slop when the banner was wiped");
+});
+
+test("dup nodes (same text, already targeted) still get cache re-apply check", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(
+    path.join(findExtDir(), "content.js"), "utf8");
+  // The dup-detection branch in enqueueNode used to silently `return` when
+  // a textNode was seen with the same text. That left the user staring at
+  // an un-flagged slop card if the platform had wiped our banner since the
+  // last sweep. Now: dup branch calls maybeReapplyFromCache before returning.
+  assert.ok(/targetedTextNodes\.has\(textNode\)[\s\S]{0,400}maybeReapplyFromCache/.test(content),
+    "dup-textnode branch calls maybeReapplyFromCache");
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1709,6 +1725,113 @@ test("LinkedIn sweep cadence is not slower than ~1 second", () => {
   assert.ok(m, "found SWEEP_INTERVAL_MS for LinkedIn");
   const ms = parseInt(m[1], 10);
   assert.ok(ms <= 1000, `LinkedIn cadence ${ms}ms is too slow (target ≤1000)`);
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 27 — Drain pipeline (overlap message round-trip with AI inference)
+// ════════════════════════════════════════════════════════════════════════
+// The single shared aiSession in the background processes inferences
+// serially, but pipelining at the messaging layer lets us hide the
+// MV3 wake-up + sendMessage overhead behind the in-flight inference.
+suite("pipeline");
+
+test("content uses a bounded in-flight drain pipeline (not a single bool)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // The old design used `let draining = false` — strictly one-at-a-time.
+  // The pipelined version counts in-flight drains and pumps up to a cap.
+  assert.ok(/PIPELINE_MAX/.test(content), "PIPELINE_MAX cap is defined");
+  assert.ok(/let inFlightDrains/.test(content), "in-flight counter exists");
+  assert.ok(/function pumpDrain/.test(content), "pumpDrain dispatcher exists");
+  assert.ok(/inFlightDrains\s*<\s*PIPELINE_MAX/.test(content),
+    "pumpDrain enforces the in-flight cap");
+});
+
+test("pipeline cap is small and bounded (≤5)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  const m = content.match(/PIPELINE_MAX\s*=\s*(\d+)/);
+  assert.ok(m, "PIPELINE_MAX is a number");
+  const max = parseInt(m[1], 10);
+  // The AI itself is serial, so a huge pipeline just queues stale work.
+  // 2-5 is the sweet spot for hiding round-trip latency.
+  assert.ok(max >= 2 && max <= 5,
+    `PIPELINE_MAX=${max} should be in the 2-5 range`);
+});
+
+test("every drainOne path decrements the in-flight counter via finish()", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // The drainOne body defines a finish() helper that's the SINGLE place
+  // inFlightDrains gets decremented. Every return path must call it.
+  assert.ok(/const finish = \(\) =>/.test(content), "finish() helper defined");
+  assert.ok(/inFlightDrains\s*=\s*Math\.max\(0,\s*inFlightDrains\s*-\s*1\)/.test(content),
+    "finish() floor-clamps the counter");
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// SUITE 28 — Perf instrumentation
+// ════════════════════════════════════════════════════════════════════════
+// Timing/throughput logs let us see WHERE time goes when the queue feels
+// sluggish: cache hit rate, queue-age latency, AI round-trip duration,
+// sweep duration.
+suite("perf-instrumentation");
+
+test("perfStats tracks the four core metrics", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/const perfStats = \{/.test(content), "perfStats object defined");
+  for (const key of ["cacheHits", "cacheMisses", "totalAgeMs", "aiCalls", "totalAiMs", "maxAiMs", "sweepCount"]) {
+    assert.ok(new RegExp(`perfStats\\.${key}`).test(content),
+      `perfStats.${key} is incremented somewhere`);
+  }
+});
+
+test("perf stats flush on a periodic interval", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  assert.ok(/function flushPerfStats/.test(content), "flushPerfStats defined");
+  assert.ok(/setInterval\(flushPerfStats/.test(content),
+    "flushPerfStats runs on a timer");
+});
+
+test("AI call timing wraps the sendMessage callback", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Must capture tAiStart BEFORE sendMessage and read it inside the callback.
+  assert.ok(/const tAiStart = performance\.now\(\);[\s\S]{0,200}chrome\.runtime\.sendMessage/.test(content),
+    "tAiStart taken before sendMessage");
+  assert.ok(/performance\.now\(\)\s*-\s*tAiStart/.test(content),
+    "duration computed inside callback");
+});
+
+test("slow-sweep warnings log immediately (not waiting for periodic flush)", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // If a sweep takes longer than the interval we want to know right away.
+  assert.ok(/sweepMs\s*>\s*SWEEP_INTERVAL_MS[\s\S]{0,200}srLog/.test(content),
+    "slow-sweep warning fires when sweepMs > interval");
+});
+
+test("queue items carry enqueuedAt so we can measure age", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const content = fs.readFileSync(path.join(findExtDir(), "content.js"), "utf8");
+  // Every push to pendingNodes must stamp enqueuedAt so the drain side
+  // can compute (drainStart - enqueuedAt) as the post's queue age.
+  const pushes = [...content.matchAll(/pendingNodes\.push\(\{[^}]*\}\)/g)];
+  assert.ok(pushes.length >= 2, "found pendingNodes.push call sites");
+  for (const p of pushes) {
+    assert.ok(/enqueuedAt/.test(p[0]),
+      `push site missing enqueuedAt: ${p[0]}`);
+  }
 });
 
 

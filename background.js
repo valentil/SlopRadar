@@ -54,7 +54,7 @@ const MAX_PATTERN_TOKENS = 3000; // rough char budget before we compact
 const DEFAULT_SETTINGS = {
   darkMode: false,
   showTrashCan: true,
-  minConfidence: 90,
+  minConfidence: 80,
   hideSlop: false, // hide slop cards entirely instead of blur/collapse
   excludedSites: [], // user-added hostnames to skip among supported sites
   showTrainingButtons: true, // show Confirm/Not-slop buttons on slop cards
@@ -543,7 +543,29 @@ let queue = [];
 // Now that `queue` is declared, set up the engine watchdog timer that
 // auto-recovers from the "model stuck initializing" limbo.
 setInterval(engineWatchdog, 2000);
+
+// Stuck-drain watchdog. If `draining` is true for more than 60 seconds, the
+// drain loop is wedged — most likely on an aiSession.prompt() that never
+// returned. The per-prompt timeout above SHOULD prevent this, but as a
+// belt-and-suspenders we forcibly reset the flag so future enqueue calls
+// can drain. The wedged prompt's sendResponse closure is lost (content
+// side already gave up via its own watchdog) so there's no caller waiting.
+const DRAIN_STUCK_MS = 60000;
+setInterval(() => {
+  if (!draining) return;
+  const stuck = Date.now() - drainStartedAt;
+  if (stuck < DRAIN_STUCK_MS) return;
+  console.warn(`[SlopRadar] Drain loop stuck for ${Math.round(stuck/1000)}s — ` +
+    `forcing reset. Queue depth=${queue?.length || 0}.`);
+  draining = false;
+  drainStartedAt = 0;
+  // Kick the next drain in case there's work waiting.
+  if (queue && queue.length > 0 && aiSession) drainQueue();
+}, 5000);
 let draining = false;
+// Wall-clock timestamp of when the current drain loop started, used by the
+// stuck-drain watchdog. Reset to 0 when draining is false.
+let drainStartedAt = 0;
 
 // Per-tab epoch. Every time a tab navigates or reloads we bump its epoch.
 // Queued items capture the epoch they were enqueued under; on drain we skip
@@ -591,6 +613,7 @@ function broadcastQueueSize() {
 async function drainQueue() {
   if (draining || !aiSession || pausedState) return;
   draining = true;
+  drainStartedAt = Date.now();
 
   while (queue.length > 0) {
     broadcastQueueSize();
@@ -614,7 +637,24 @@ async function drainQueue() {
     const patterns = await getPatterns();
 
     try {
-      const result = await aiSession.prompt(buildPrompt(item.text, patterns, item.platform));
+      // Wrap aiSession.prompt in a timeout so a wedged Gemini session can't
+      // block the drain forever. Without this, a hung prompt makes draining
+      // stay true permanently, and every subsequent enqueue returns at the
+      // `if (draining) return` guard — the queue grows but nothing moves.
+      // 25s is well past the slowest healthy inference observed (~10s) but
+      // short enough that the content-side 30s watchdog will fire AFTER
+      // we've already reported a degraded verdict on this side.
+      const promptText = buildPrompt(item.text, patterns, item.platform);
+      let timeoutHandle;
+      const result = await Promise.race([
+        aiSession.prompt(promptText),
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error("aiSession.prompt timeout after 25s")),
+            25000
+          );
+        }),
+      ]).finally(() => clearTimeout(timeoutHandle));
       const rawOutput = (result || "").trim();
 
       // Parse the verdict. Critically, we distinguish three outcomes:
@@ -636,7 +676,20 @@ async function drainQueue() {
             degraded = true; // model returned JSON but not OUR schema
           } else {
             isSlop = parsed.slop === 1;
-            confidence = Math.min(100, Math.max(1, Math.round(parsed.confidence)));
+            // Confidence must be a finite number. The model occasionally
+            // returns the literal placeholder ("<integer 50-99>") or other
+            // junk in this field; Math.round on those produces NaN which
+            // would silently fall through as confidence 0 / not slop. Catch
+            // that here and treat as degraded.
+            const rawConf = typeof parsed.confidence === "number"
+              ? parsed.confidence
+              : parseFloat(parsed.confidence);
+            if (!Number.isFinite(rawConf)) {
+              console.warn(`[SlopRadar] Non-numeric confidence: ${JSON.stringify(parsed.confidence)} — treating as degraded`);
+              degraded = true;
+            } else {
+              confidence = Math.min(100, Math.max(1, Math.round(rawConf)));
+            }
             // Reasons: 1-3 short phrases. Defensively clean & cap.
             if (Array.isArray(parsed.reasons)) {
               reasons = parsed.reasons
@@ -822,8 +875,9 @@ Input Text:
 ${text}
 """
 
-Respond with ONLY a JSON object: {"slop": 1, "confidence": 87, "reasons": ["...", "..."]}.
-- "reasons" is an array of 1-3 SHORT phrases (each under 8 words) explaining WHY the post triggered as slop. Each phrase MUST describe something specific about THIS post — never copy or paraphrase the schema example above. Good examples for slop posts: "vague 'this image' framing", "engagement-bait opener", "no specific claims".
+Respond with ONLY a JSON object: {"slop": 1, "confidence": <integer 50-99>, "reasons": ["...", "..."]}.
+- "confidence" is YOUR certainty (integer 50-99): 95+ for obvious slop with multiple signals, 75-89 for moderate cases, 50-65 for borderline. Do NOT use the same number for every response — calibrate to the specific post. For authentic posts use 50-70 unless the post is clearly authentic with strong specific details.
+- "reasons" is an array of 1-3 SHORT phrases (each under 8 words) explaining WHY the post triggered as slop. Each phrase MUST describe something specific about THIS post. Good examples for slop posts: "vague 'this image' framing", "engagement-bait opener", "no specific claims".
 - For authentic posts (slop: 0), "reasons" may be empty [].
 - No markdown, no preamble, no explanation outside the JSON.`;
 }
